@@ -143,10 +143,11 @@ int main(int argc, char** argv) {
     const char* s = src.c_str();
     cl_program prog = clCreateProgramWithSource(ctx, 1, &s, nullptr, &err);
     CHECK(err);
-    char opts[512];
+    char opts[1024];
+    const char* extra = std::getenv("PRP2_OPTS");
     std::snprintf(opts, sizeof(opts),
-                  "-D W=%u -D H=%u -D LOGW=%u -D LOGH=%u -D LOGL=%d -D NEXP=%uu -D CC=%lldL",
-                  W, H, logW, logH, logL, n, cc);
+                  "-D W=%u -D H=%u -D LOGW=%u -D LOGH=%u -D LOGL=%d -D NEXP=%uu -D CC=%lldL -D WSPLIT=%u %s",
+                  W, H, logW, logH, logL, n, cc, (unsigned)((logL + 1) / 2), extra ? extra : "");
     if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         size_t len;
         clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
@@ -165,20 +166,24 @@ int main(int argc, char** argv) {
     std::vector<cplx> twW(W), twH(H), twN1(W), twN2(H);
     for (uint32_t i = 0; i < W; ++i) { twW[i] = root(i, W); twN1[i] = root(i, NC); }
     for (uint32_t i = 0; i < H; ++i) { twH[i] = root(i, H); twN2[i] = root((uint64_t)W * i, NC); }
-    std::vector<cplx> WT(NC), IWT(NC);
-    const double log2c = std::log2((double)cc);
-    auto weight = [&](uint64_t j) {
-        uint64_t r = ((uint64_t)n * j) % L;  // frac = ((L - r) mod L)/L
-        double frac = (double)((L - r) % L) / (double)L;
-        return std::exp2(frac + (double)j * log2c / (double)L);
-    };
-    for (uint32_t h = 0; h < H; ++h)
-        for (uint32_t w = 0; w < W; ++w) {
-            uint64_t m = h + (uint64_t)H * w, p = (uint64_t)h * W + w;
-            double a = weight(2 * m), b = weight(2 * m + 1);
-            WT[p] = {a, b};
-            IWT[p] = {1.0 / (a * NC), 1.0 / (b * NC)};
+    const uint32_t WSPLIT = (logL + 1) / 2;
+    const size_t TS = (size_t)1 << WSPLIT;
+    std::vector<double> WTAB(8 * TS, 1.0);
+    {
+        const double log2c = std::log2((double)cc);
+        for (size_t i = 0; i < TS; ++i) {
+            double a = (double)i / (double)L;                    // 2^(r_lo/L)
+            double b = (double)(i << WSPLIT) / (double)L;        // 2^(r_hi 2^S / L)
+            if (i < TS) { WTAB[i] = std::exp2(a); WTAB[4 * TS + i] = std::exp2(-a); }
+            if ((i << WSPLIT) < L) { WTAB[TS + i] = std::exp2(b); WTAB[5 * TS + i] = std::exp2(-b); }
+            WTAB[2 * TS + i] = std::exp2(a * log2c);
+            WTAB[6 * TS + i] = std::exp2(-a * log2c);
+            if ((i << WSPLIT) < L) {
+                WTAB[3 * TS + i] = std::exp2(b * log2c);
+                WTAB[7 * TS + i] = std::exp2(-b * log2c) / (double)NC;
+            }
         }
+    }
 
     auto mk = [&](size_t bytes, const void* init) {
         cl_mem b = clCreateBuffer(ctx, CL_MEM_READ_WRITE | (init ? CL_MEM_COPY_HOST_PTR : 0), bytes,
@@ -188,7 +193,7 @@ int main(int argc, char** argv) {
     };
     cl_mem bTwW = mk(16 * W, twW.data()), bTwH = mk(16 * H, twH.data());
     cl_mem bTwN1 = mk(16 * W, twN1.data()), bTwN2 = mk(16 * H, twN2.data());
-    cl_mem bWT = mk(16 * NC, WT.data()), bIWT = mk(16 * NC, IWT.data());
+    cl_mem bWT = mk(8 * WTAB.size(), WTAB.data()), bIWT = bWT;
     cl_mem bA = mk(16 * NC, nullptr), bA2 = mk(16 * NC, nullptr);
     uint32_t zero = 0;
     cl_mem bErr = mk(4, &zero);
@@ -237,16 +242,28 @@ int main(int argc, char** argv) {
     bool profNow = false;
     double tF = 0, tT = 0, tI = 0;
     long long nprof = 0;
+    std::vector<std::pair<cl_event, double*>> pend;
+    cl_ulong spanA = 0, spanB = 0;
+    auto flushProf = [&]() {
+        if (pend.empty()) return;
+        clWaitForEvents(1, &pend.back().first);
+        for (auto& pe : pend) {
+            cl_ulong a, b;
+            clGetEventProfilingInfo(pe.first, CL_PROFILING_COMMAND_START, 8, &a, nullptr);
+            clGetEventProfilingInfo(pe.first, CL_PROFILING_COMMAND_END, 8, &b, nullptr);
+            *pe.second += (b - a) * 1e-6;
+            if (!spanA || a < spanA) spanA = a;
+            if (b > spanB) spanB = b;
+            clReleaseEvent(pe.first);
+        }
+        pend.clear();
+    };
     auto enq = [&](cl_kernel k, size_t g, double* acc) {
         cl_event e;
         CHECK(clEnqueueNDRangeKernel(q, k, 1, nullptr, &g, &WGS, 0, nullptr, profNow ? &e : nullptr));
         if (profNow) {
-            clWaitForEvents(1, &e);
-            cl_ulong a, b;
-            clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, 8, &a, nullptr);
-            clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, 8, &b, nullptr);
-            *acc += (b - a) * 1e-6;
-            clReleaseEvent(e);
+            pend.push_back({e, acc});
+            if (pend.size() >= 600) flushProf();
         }
     };
     auto fwd = [&](Num a, cl_mem out) {
@@ -403,13 +420,14 @@ int main(int argc, char** argv) {
         // plain run (benchmark / partial residue check)
         todo = iters_limit > 0 ? std::min<long long>(iters_limit, total) : total;
         for (long long it = 0; it < todo; ++it) {
-            profNow = prof && it >= 20 && nprof < 2000;
+            profNow = prof && it >= 200 && nprof < 3000;
             sqr(X, mulcOf(it));
             if (profNow) ++nprof;
             throttle();
             if ((it + 1) % report == 0 || it + 1 == todo) progress(it + 1, "plain");
         }
         clFinish(q);
+        flushProf();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("done %lld iterations in %.2f s  (%.4f ms/iter)\n", todo, el, 1000.0 * el / todo);
         if (nprof)

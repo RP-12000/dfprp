@@ -14,6 +14,16 @@ typedef double2 T2;
 #define NC (W * H)
 #define LL (2 * NC)
 #define WG 64
+#ifdef HACK_CONTIG
+#define TIDX(row, col) ((col) * H + (row))
+#else
+#define TIDX(row, col) ((row) * W + (col))
+#endif
+#ifdef HACK_NOFFT
+#define FFT_LDS(a, b, P, lP, nb, tw, d) (a)
+#else
+#define FFT_LDS fft_lds
+#endif
 
 inline T2 cmul(T2 a, T2 b) { return (T2)(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x)); }
 inline T2 conjg(T2 a) { return (T2)(a.x, -a.y); }
@@ -101,12 +111,20 @@ __local T2* fft_lds(__local T2* a, __local T2* b, const uint P, const uint logP,
 }
 
 // twN1[i] = w_N^i for i < W ; twN2[i] = w_N^(W i) = w_H^i for i < H
+// weight of digit j from 4 small tables: 2^(r/L) * c^(j/L), r = (-n j) mod L. inv: reciprocal tables (incl. 1/N)
+inline double wgt(__global const double* tb, uint j, uint inv) {
+    const uint r = (0u - (uint)NEXP * j) & (LL - 1);
+    __global const double* t = tb + (inv << (WSPLIT + 2));
+    return (t[r & ((1u << WSPLIT) - 1)] * t[(1u << WSPLIT) + (r >> WSPLIT)]) *
+           (t[(2u << WSPLIT) + (j & ((1u << WSPLIT) - 1))] * t[(3u << WSPLIT) + (j >> WSPLIT)]);
+}
+
 inline T2 twN(__global const T2* twN1, __global const T2* twN2, uint e) {
     return cmul(twN1[e & (W - 1)], twN2[e / W]);
 }
 
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
-void fwdW(__global const int2* D, __global const long* CY, __global const T2* WT, __global T2* A,
+void fwdW(__global const int2* D, __global const long* CY, __global const double* WT, __global T2* A,
           __global const T2* twW, __global const T2* twN1, __global const T2* twN2) {
     __local T2 s1[W], s2[W];
     const uint h = get_group_id(0), t = get_local_id(0);
@@ -121,11 +139,10 @@ void fwdW(__global const int2* D, __global const long* CY, __global const T2* WT
         long c0;
         long d0 = bal((long)d.x + cin, dbits(2 * m), &c0);
         long d1 = (long)d.y + c0;
-        T2 wt = WT[pos];
-        s1[w] = (T2)((double)d0 * wt.x, (double)d1 * wt.y);
+        s1[w] = (T2)((double)d0 * wgt(WT, 2 * m, 0), (double)d1 * wgt(WT, 2 * m + 1, 0));
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local T2* r = fft_lds(s1, s2, W, LOGW, 1, twW, 1);
+    __local T2* r = FFT_LDS(s1, s2, W, LOGW, 1, twW, 1);
     for (uint kw = t; kw < W; kw += WG) A[h * W + kw] = cmul(r[kw], twN(twN1, twN2, h * kw));
 }
 
@@ -162,14 +179,14 @@ inline void tailImpl(__local T2* s1, __local T2* s2, __global T2* A, __global co
     const uint col1 = g, col2 = g == 0 ? W / 2 : W - g;
     for (uint i = t; i < 2 * H; i += WG) {
         uint col = i < H ? col1 : col2;
-        s1[i] = A[(i & (H - 1)) * W + col];
+        s1[i] = A[TIDX(i & (H - 1), col)];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local T2* r = fft_lds(s1, s2, H, LOGH, 2, twH, 1);
+    __local T2* r = FFT_LDS(s1, s2, H, LOGH, 2, twH, 1);
     if (mode == 1) {
         for (uint i = t; i < 2 * H; i += WG) {
             uint col = i < H ? col1 : col2;
-            A[(i & (H - 1)) * W + col] = r[i];
+            A[TIDX(i & (H - 1), col)] = r[i];
         }
         return;
     }
@@ -193,10 +210,10 @@ inline void tailImpl(__local T2* s1, __local T2* s2, __global T2* A, __global co
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     __local T2* other = r == s1 ? s2 : s1;
-    r = fft_lds(r, other, H, LOGH, 2, twH, -1);
+    r = FFT_LDS(r, other, H, LOGH, 2, twH, -1);
     for (uint i = t; i < 2 * H; i += WG) {
         uint col = i < H ? col1 : col2;
-        A[(i & (H - 1)) * W + col] = r[i];
+        A[TIDX(i & (H - 1), col)] = r[i];
     }
 }
 
@@ -218,7 +235,7 @@ void tailMul(__global T2* A, __global const T2* twH, __global const T2* twN1, __
 }
 
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
-void invW(__global const T2* A, __global int2* D, __global long* CY, __global const T2* IWT,
+void invW(__global const T2* A, __global int2* D, __global long* CY, __global const double* IWT,
           __global const T2* twW, __global const T2* twN1, __global const T2* twN2, const int mulc,
           __global uint* maxerr) {
     __local T2 s1[W], s2[W];
@@ -227,13 +244,12 @@ void invW(__global const T2* A, __global int2* D, __global long* CY, __global co
     if (t == 0) lerr = 0;
     for (uint kw = t; kw < W; kw += WG) s1[kw] = cmul(A[h * W + kw], conjg(twN(twN1, twN2, h * kw)));
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local T2* r = fft_lds(s1, s2, W, LOGW, 1, twW, -1);
+    __local T2* r = FFT_LDS(s1, s2, W, LOGW, 1, twW, -1);
     double emax = 0;
     for (uint w = t; w < W; w += WG) {
         const uint pos = h * W + w;
         const uint m = h + H * w;
-        T2 iw = IWT[pos];
-        double x0 = r[w].x * iw.x, x1 = r[w].y * iw.y;
+        double x0 = r[w].x * wgt(IWT, 2 * m, 1), x1 = r[w].y * wgt(IWT, 2 * m + 1, 1);
         double r0 = rint(x0), r1 = rint(x1);
         emax = fmax(emax, fmax(fabs(x0 - r0), fabs(x1 - r1)));
         long c0, c1;
