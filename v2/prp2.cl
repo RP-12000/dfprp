@@ -141,9 +141,23 @@ inline void sqpair(T2* Vk, T2* Vn, T2 t2) {
     *Vn = conjg(P) + (T2)(2 * Q.y, 2 * Q.x);  // 2i * conj(Q)
 }
 
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
-void tail(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2) {
-    __local T2 s1[2 * H], s2[2 * H];
+// multiply step: (Vk, Vn) *= (Uk, Un) as real-FFT spectra
+inline void mulpair(T2* Vk, T2* Vn, T2 Uk, T2 Un, T2 t2) {
+    T2 a = *Vk, b = conjg(*Vn);
+    T2 Ex = (a + b) * 0.5, dx = a - b;
+    T2 Ox = (T2)(dx.y * 0.5, -dx.x * 0.5);
+    T2 c = Uk, d = conjg(Un);
+    T2 Ey = (c + d) * 0.5, dy = c - d;
+    T2 Oy = (T2)(dy.y * 0.5, -dy.x * 0.5);
+    T2 E = cmul(Ex, Ey) + cmul(t2, cmul(Ox, Oy));
+    T2 O = cmul(Ex, Oy) + cmul(Ox, Ey);
+    *Vk = E + (T2)(-O.y, O.x);
+    *Vn = conjg(E) + (T2)(O.y, O.x);  // conj(E) + i conj(O)
+}
+
+// mode 0: square, mode 1: forward column FFT only (A -> A), mode 2: multiply by Bf (already forward)
+inline void tailImpl(__local T2* s1, __local T2* s2, __global T2* A, __global const T2* Bf, __global const T2* twH,
+                     __global const T2* twN1, __global const T2* twN2, const int mode) {
     const uint g = get_group_id(0), t = get_local_id(0);
     const uint col1 = g, col2 = g == 0 ? W / 2 : W - g;
     for (uint i = t; i < 2 * H; i += WG) {
@@ -152,32 +166,30 @@ void tail(__global T2* A, __global const T2* twH, __global const T2* twN1, __glo
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     __local T2* r = fft_lds(s1, s2, H, LOGH, 2, twH, 1);
+    if (mode == 1) {
+        for (uint i = t; i < 2 * H; i += WG) {
+            uint col = i < H ? col1 : col2;
+            A[(i & (H - 1)) * W + col] = r[i];
+        }
+        return;
+    }
     __local T2* x1 = r;
     __local T2* x2 = r + H;
-    if (g != 0) {
-        for (uint kh = t; kh < H; kh += WG) {
-            T2 a = x1[kh], b = x2[H - 1 - kh];
-            sqpair(&a, &b, twN(twN1, twN2, col1 + W * kh));
-            x1[kh] = a;
-            x2[H - 1 - kh] = b;
-        }
-    } else {
-        // column 0: k = W kh pairs with (H - kh) mod H ; column W/2: kh pairs with H-1-kh
-        for (uint u = t; u < H / 2 + 1 + H / 2; u += WG) {
-            if (u <= H / 2) {
-                uint kh = u, kn = (H - kh) & (H - 1);
-                T2 a = x1[kh], b = x1[kn];
-                sqpair(&a, &b, twN(twN1, twN2, W * kh));
-                x1[kh] = a;
-                if (kn != kh) x1[kn] = b;
-            } else {
-                uint kh = u - (H / 2 + 1);
-                T2 a = x2[kh], b = x2[H - 1 - kh];
-                sqpair(&a, &b, twN(twN1, twN2, W / 2 + W * kh));
-                x2[kh] = a;
-                x2[H - 1 - kh] = b;
-            }
-        }
+    // pairs: (arrK, iK) with (arrN, iN), k index for twiddle
+    const uint npairs = g != 0 ? H : H + 1;
+    for (uint u = t; u < npairs; u += WG) {
+        uint ia, ib, colA, colB, kk;
+        __local T2* pa;
+        __local T2* pb;
+        if (g != 0) { ia = u; ib = H - 1 - u; pa = x1; pb = x2; colA = col1; colB = col2; kk = col1 + W * u; }
+        else if (u <= H / 2) { ia = u; ib = (H - u) & (H - 1); pa = x1; pb = x1; colA = colB = 0; kk = W * u; }
+        else { ia = u - (H / 2 + 1); ib = H - 1 - ia; pa = x2; pb = x2; colA = colB = W / 2; kk = W / 2 + W * ia; }
+        T2 a = pa[ia], b = pb[ib];
+        T2 tw2 = twN(twN1, twN2, kk);
+        if (mode == 0) sqpair(&a, &b, tw2);
+        else mulpair(&a, &b, Bf[ia * W + colA], Bf[ib * W + colB], tw2);
+        pa[ia] = a;
+        if (!(pa == pb && ia == ib)) pb[ib] = b;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     __local T2* other = r == s1 ? s2 : s1;
@@ -186,6 +198,23 @@ void tail(__global T2* A, __global const T2* twH, __global const T2* twN1, __glo
         uint col = i < H ? col1 : col2;
         A[(i & (H - 1)) * W + col] = r[i];
     }
+}
+
+__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+void tail(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2) {
+    __local T2 s1[2 * H], s2[2 * H];
+    tailImpl(s1, s2, A, A, twH, twN1, twN2, 0);
+}
+__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+void tailFwd(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2) {
+    __local T2 s1[2 * H], s2[2 * H];
+    tailImpl(s1, s2, A, A, twH, twN1, twN2, 1);
+}
+__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+void tailMul(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2,
+             __global const T2* Bf) {
+    __local T2 s1[2 * H], s2[2 * H];
+    tailImpl(s1, s2, A, Bf, twH, twN1, twN2, 2);
 }
 
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
