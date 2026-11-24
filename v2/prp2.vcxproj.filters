@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Host">
+      <UniqueIdentifier>{ad4627af-7401-4c4d-bab0-4bbc221985af}</UniqueIdentifier>
+      <Extensions>cpp;h</Extensions>
+    </Filter>
+    <Filter Include="OpenCL Kernels">
+      <UniqueIdentifier>{215d1f7f-ee08-41bc-a00e-2ccd8ef6c210}</UniqueIdentifier>
+      <Extensions>cl</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="prp2.cpp">
+      <Filter>Host</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CopyFileToFolders Include="prp2.cl">
+      <Filter>OpenCL Kernels</Filter>
+    </CopyFileToFolders>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Host">
+      <UniqueIdentifier>{478c1d59-cc16-4184-a1cc-64975779555d}</UniqueIdentifier>
+      <Extensions>cpp;h</Extensions>
+    </Filter>
+    <Filter Include="OpenCL Kernels">
+      <UniqueIdentifier>{62679da4-4758-4daf-9461-6245c2d878fa}</UniqueIdentifier>
+      <Extensions>cl</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="mbench2.cpp">
+      <Filter>Host</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

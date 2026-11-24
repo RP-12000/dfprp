@@ -1,0 +1,24 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/v1 prototype/">
+    <Project Path="gpuprp.vcxproj" />
+  </Folder>
+  <Folder Name="/v2/">
+    <Project Path="v2/prp2.vcxproj" />
+    <Project Path="v2/prp3.vcxproj" />
+    <Project Path="v2/prp4.vcxproj" />
+    <Project Path="v2/mbench.vcxproj" />
+    <Project Path="v2/mbench2.vcxproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+    <File Path="GpuPRP.props" />
+    <File Path=".gitignore" />
+    <File Path="v2/check.py" />
+    <File Path="v2/build.bat" />
+  </Folder>
+</Solution>

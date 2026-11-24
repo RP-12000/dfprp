@@ -6,3 +6,9 @@ v2/*.exe
 v2/*.obj
 v2/*.dll
 v2/isa/
+bin/
+obj/
+.vs/
+*.user
+*.pdb
+*.ckpt
