@@ -69,19 +69,40 @@ def parse(log):
             verdict.group(1) if verdict else None, float(ms.group(1)) if ms else None)
 
 
+RUNNING = []          # live dfprp processes, killed on Ctrl+C
+STOP = threading.Event()
+PROGRESS_EVERY = 60   # seconds between progress lines
+
+
+def last_progress(path):
+    try:
+        lines = [l for l in open(path).read().splitlines() if ' iter ' in l or 'Gerbicz' in l or 'resumed' in l]
+        return lines[-1] if lines else 'starting'
+    except OSError:
+        return 'starting'
+
+
 def run_one(dev, n, c, args, cwd, logname, deadline):
     os.makedirs(cwd, exist_ok=True)
     cmd = [EXE, str(n), str(c), '-dev', str(dev)] + args
-    t0 = time.time()
-    with open(os.path.join(cwd, logname), 'w') as lf:
+    t0 = t_print = time.time()
+    path = os.path.join(cwd, logname)
+    with open(path, 'w') as lf:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, text=True)
-        while p.poll() is None:
-            if deadline and time.time() > deadline:
-                p.kill()
-                p.wait()
-                return None, time.time() - t0
-            time.sleep(2)
-    return open(os.path.join(cwd, logname)).read(), time.time() - t0
+        RUNNING.append(p)
+        try:
+            while p.poll() is None:
+                if STOP.is_set() or (deadline and time.time() > deadline):
+                    p.kill()
+                    p.wait()
+                    return None, time.time() - t0
+                if time.time() - t_print >= PROGRESS_EVERY:
+                    t_print = time.time()
+                    print(f'[GPU {dev}] n={n}: {last_progress(path)}', flush=True)
+                time.sleep(2)
+        finally:
+            RUNNING.remove(p)
+    return open(path).read(), time.time() - t0
 
 
 def selftest(c):
@@ -136,9 +157,11 @@ def worker(dev, queue, c, deadline, done):
         if (n, -c) in done:
             continue
         print(f'[GPU {dev}] start n={n}', flush=True)
-        log, secs = run_one(dev, n, c, [], ck, f'dfprp_{n}.log', deadline)
+        log, secs = run_one(dev, n, c, ['-report', '250000'], ck, f'dfprp_{n}.log', deadline)
         if log is None:
-            print(f'[GPU {dev}] time limit: n={n} stopped, checkpoint kept for the next session', flush=True)
+            why = 'stopped' if STOP.is_set() else 'time limit'
+            print(f'[GPU {dev}] {why}: n={n} interrupted, its checkpoint (saved every 1M iterations) is kept',
+                  flush=True)
             return
         res64, res2048, verdict, ms = parse(log)
         if not res64 or not verdict:
@@ -163,6 +186,10 @@ def worker(dev, queue, c, deadline, done):
 
 def main(mode, exponents, c, hours):
     t_start = time.time()
+    # dfprp processes left over from an interrupted run would fight over the GPU and the checkpoint files
+    if subprocess.run(['pkill', '-f', EXE], capture_output=True).returncode == 0:
+        print('stopped dfprp processes left over from an earlier run (they resume from their checkpoints)')
+        time.sleep(2)
     build()
     if mode == 'selftest':
         selftest(c)
@@ -174,11 +201,22 @@ def main(mode, exponents, c, hours):
     ngpu = gpu_count()
     deadline = t_start + hours * 3600
     print(f'{len(queue)} exponents to test on {ngpu} GPU(s); stopping at {hours} h')
-    ts = [threading.Thread(target=worker, args=(dev, queue, c, deadline, done)) for dev in range(ngpu)]
+    print(f'progress every {PROGRESS_EVERY} s; full logs in {WORK}/ckpt/dfprp_<n>.log', flush=True)
+    ts = [threading.Thread(target=worker, args=(dev, queue, c, deadline, done), daemon=True)
+          for dev in range(ngpu)]
     for t in ts:
         t.start()
-    for t in ts:
-        t.join()
+    try:
+        while any(t.is_alive() for t in ts):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        STOP.set()
+        for p in list(RUNNING):
+            p.kill()
+        for t in ts:
+            t.join(10)
+        print('interrupted: dfprp stopped; run again to resume from the checkpoints')
+        return
     print(f'finished: {len(done)} results in {WORK}/results.jsonl, {len(queue)} exponents not started')
 
 
