@@ -10,7 +10,9 @@
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
 
 #define LL (W * H)
+#ifndef WG
 #define WG 64
+#endif
 #define NSEG (H / SEG)
 
 inline uint mm(uint a, uint b, uint p, uint pinv) {  // a*b/2^32 mod p (Montgomery)

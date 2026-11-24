@@ -166,9 +166,10 @@ int main(int argc, char** argv) {
                       "#define NCOL %uu\n#define SEG %uu\n#define TG %uu\n#define NEXP %uu\n#define CC %lldL\n"
                       "#define P0 %uu\n#define P1 %uu\n#define P2 %uu\n#define PINV0 %uu\n#define PINV1 %uu\n"
                       "#define PINV2 %uu\n#define S0 %uu\n#define S1 %uu\n#define S2 %uu\n#define C12M %uu\n"
-                      "#define C13M %uu\n#define C23M %uu\n#define P01LO %uu\n#define P01HI %uu\n",
+                      "#define C13M %uu\n#define C23M %uu\n#define P01LO %uu\n#define P01HI %uu\n#define WG %u\n",
                       W, H, WN, (u32)K, (u32)(K >> 32), NCOL, SEG, TG, n, cc, p1, p2, p3, PINV[0], PINV[1],
-                      PINV[2], S[0], S[1], S[2], C12M, C13M, C23M, (u32)P01, (u32)(P01 >> 32));
+                      PINV[2], S[0], S[1], S[2], C12M, C13M, C23M, (u32)P01, (u32)(P01 >> 32),
+                      (u32)(std::getenv("PRP4_WG") ? std::atoi(std::getenv("PRP4_WG")) : 64));
         hdr = b;
         hdr += "#define WSTAGES " + stages(W, "STW") + "\n";
         hdr += "#define HSTAGES " + stages(H, "STH") + "\n";
@@ -243,7 +244,7 @@ int main(int argc, char** argv) {
     clSetKernelArg(kI, 4, sizeof(cl_mem), &bTwN2);
     clSetKernelArg(kC, 0, sizeof(cl_mem), &bZ);
 
-    const size_t WGS = 64;
+    const size_t WGS = std::getenv("PRP4_WG") ? (size_t)std::atoi(std::getenv("PRP4_WG")) : 64;
     const size_t gF = (size_t)H * WGS, gT = (size_t)(W / TG) * WGS, gI = (size_t)H * WGS;
     const size_t gC = (NXC + WGS - 1) / WGS * WGS;
     cl_mem curF = nullptr, curFout = nullptr, curC = nullptr;
