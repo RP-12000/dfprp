@@ -10,3 +10,4 @@ obj/
 res_*.txt
 isa/
 v2/
+__pycache__/

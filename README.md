@@ -33,3 +33,12 @@ dfprp n [c=25] [-iters k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-report 
 (still in git history before this commit): FP64 0.452 ms (full n = 3678495 run matched Prime95's res64 and
 res2048), integer NTT over three primes 0.51 ms. After 2000 iterations at n = 4,000,037 all three gave RES64
 146B8A66141B5E63.
+
+## Kaggle
+
+`kaggle/dfprp_kaggle.ipynb` clones this repository (https://github.com/RP-12000/dfprp) and runs
+`kaggle/kaggle_run.py`, which builds dfprp with g++ against the NVIDIA OpenCL driver. Upload the notebook with a GPU
+accelerator and Internet on, and pick `MODE = 'selftest'` (build + check + benchmark), `'verify'` (full tests of
+exponents Prime95 already did) or `'run'` (an exponent list; results in `results.jsonl`, checkpoints resume across
+sessions, one queue per GPU). The notebook runs whatever is on GitHub, so push changes before running it.
+The NVIDIA build path has not been tested on real hardware yet.
