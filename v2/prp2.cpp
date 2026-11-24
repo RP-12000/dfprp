@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
     }
     if (!logL) { logL = 4; while ((double)n / (double)(1ull << logL) > maxbits) ++logL; }
     const uint64_t L = 1ull << logL, NC = L / 2;
-    uint32_t W = 512;
+    uint32_t W = std::getenv("PRP2_W") ? (uint32_t)std::atoi(std::getenv("PRP2_W")) : 512;
     while (W > 2 && NC / W < 2) W >>= 1;
     const uint32_t H = (uint32_t)(NC / W);
     const uint32_t logW = ilog2(W), logH = ilog2(H);
