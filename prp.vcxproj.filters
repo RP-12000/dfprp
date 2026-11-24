@@ -2,17 +2,22 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Host">
-      <UniqueIdentifier>{478c1d59-cc16-4184-a1cc-64975779555d}</UniqueIdentifier>
+      <UniqueIdentifier>{8eb44042-4396-4810-ad29-92b8cadc0dd9}</UniqueIdentifier>
       <Extensions>cpp;h</Extensions>
     </Filter>
     <Filter Include="OpenCL Kernels">
-      <UniqueIdentifier>{62679da4-4758-4daf-9461-6245c2d878fa}</UniqueIdentifier>
+      <UniqueIdentifier>{f2839418-d355-49ca-928d-0b5cf73ae0d7}</UniqueIdentifier>
       <Extensions>cl</Extensions>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="mbench2.cpp">
+    <ClCompile Include="prp.cpp">
       <Filter>Host</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CopyFileToFolders Include="prp.cl">
+      <Filter>OpenCL Kernels</Filter>
+    </CopyFileToFolders>
   </ItemGroup>
 </Project>

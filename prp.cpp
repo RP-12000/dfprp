@@ -1,5 +1,11 @@
-// prp2: GPU Fermat PRP (base 3) for N = 2^n - c using a weighted real FFT (no zero padding).
-// usage: prp2 n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]
+// prp: GPU Fermat PRP (base 3) for N = 2^n - c. Weighted real FFT (the DWT weights 2^(ceil(nj/L)-nj/L) * c^(j/L)
+// fold 2^n == c into the transform, so no zero padding), computed entirely in double-float arithmetic
+// (pairs of FP32, ~48-bit mantissa) because consumer GPUs (T4, Radeon iGPUs) have very slow FP64.
+// FFT length L = 2^k, 3*2^k or 5*2^k; Gerbicz error check; checkpoint/resume.
+// usage: prp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
+//        [-inject it] [-dev i]
+// env:   PRP_LM=m (with -L k: length m*2^k), PRP_W (line width, default 512), PRP_TG (tail columns per group),
+//        PRP_OPTS (extra OpenCL build options)
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 
@@ -57,7 +63,7 @@ static uint32_t ilog2(uint64_t v) { uint32_t l = 0; while ((1ull << l) < v) ++l;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: prp2 n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
+        std::printf("usage: prp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -67,7 +73,7 @@ int main(int argc, char** argv) {
     int logL = 0;
     long long iters_limit = 0;
     bool prof = false;
-    double maxbits = 15.8;
+    double maxbits = 12.8;
     int devIdx = 0;
     long long report = 100000;
     int GB = 1000;  // Gerbicz block size (check every GB^2 iterations)
@@ -87,16 +93,41 @@ int main(int argc, char** argv) {
         else if (a == "-fresh") resume = false;
         else { std::fprintf(stderr, "bad arg %s\n", a.c_str()); return 1; }
     }
-    if (!logL) { logL = 4; while ((double)n / (double)(1ull << logL) > maxbits) ++logL; }
-    const uint64_t L = 1ull << logL, NC = L / 2;
-    uint32_t W = std::getenv("PRP2_W") ? (uint32_t)std::atoi(std::getenv("PRP2_W")) : 512;
-    while (W > 2 && NC / W < 2) W >>= 1;
+    // candidate lengths L = m * 2^k, m in {1, 3, 5}; -L k forces 2^k, or m*2^k with PRP_LM=m
+    uint64_t L = 0;
+    {
+        const char* lm = std::getenv("PRP_LM");
+        if (logL) L = (uint64_t)(lm ? std::atoi(lm) : 1) << logL;
+        else {
+            for (uint64_t cand = 64;; ++cand) {
+                uint64_t v = cand;
+                while (v % 2 == 0) v /= 2;
+                if (v != 1 && v != 3 && v != 5) continue;
+                if ((cand & (cand - 1)) && cand % 2048) continue;  // need W=512 | L/2 and an even H
+                if ((double)n / (double)cand <= maxbits) { L = cand; break; }
+            }
+        }
+    }
+    const uint64_t NC = L / 2;
+    uint32_t W = std::getenv("PRP_W") ? (uint32_t)std::atoi(std::getenv("PRP_W")) : 512;
+    while (W > 2 && (NC % W != 0 || NC / W < 2)) W >>= 1;
     const uint32_t H = (uint32_t)(NC / W);
-    const uint32_t logW = ilog2(W), logH = ilog2(H);
-    uint32_t TGc = std::getenv("PRP2_TG") ? (uint32_t)std::atoi(std::getenv("PRP2_TG")) : 2;
+    uint32_t TGc = std::getenv("PRP_TG") ? (uint32_t)std::atoi(std::getenv("PRP_TG")) : 1;
     while (TGc > 1 && (2 * TGc * H > 1024 || 2 * TGc > W / 2)) TGc >>= 1;
-    std::printf("n=%u c=%lld  L=%llu (2^%d real, %.3f bits/word)  W=%u H=%u\n", n, cc,
-                (unsigned long long)L, logL, (double)n / L, W, H);
+    std::printf("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u  [double-float]\n", n, cc,
+                (unsigned long long)L, (double)n / L, W, H);
+    auto stages = [](uint32_t P, const char* tag) {
+        std::string out;
+        uint32_t ps = 1, rest = P;
+        auto add = [&](uint32_t R) { char b[64]; std::snprintf(b, sizeof(b), "%s(%u,%u) ", tag, R, ps); out += b; ps *= R; rest /= R; };
+        while (rest % 5 == 0) add(5);
+        while (rest % 3 == 0) add(3);
+        while (rest % 8 == 0) add(8);
+        if (rest % 4 == 0) add(4);
+        if (rest % 2 == 0) add(2);
+        if (rest != 1) { std::fprintf(stderr, "unsupported length %u\n", P); std::exit(1); }
+        return out;
+    };
 
     // ---- OpenCL setup
     cl_uint np = 0;
@@ -137,19 +168,45 @@ int main(int argc, char** argv) {
     std::string exe_dir = argv[0];
     auto pos = exe_dir.find_last_of("\\/");
     exe_dir = pos == std::string::npos ? "" : exe_dir.substr(0, pos + 1);
-    std::ifstream kf(exe_dir + "prp2.cl");
-    if (!kf) { std::fprintf(stderr, "cannot open prp2.cl\n"); return 1; }
+    std::ifstream kf(exe_dir + "prp.cl");
+    if (!kf) { std::fprintf(stderr, "cannot open prp.cl\n"); return 1; }
     std::stringstream ss;
     ss << kf.rdbuf();
-    std::string src = ss.str();
+    const uint32_t NH = (uint32_t)(L / 512 + 2);
+    auto dfc = [](double v) {
+        float hi = (float)v;
+        float lo = (float)(v - (double)hi);
+        char b[128];
+        std::snprintf(b, sizeof(b), "(%af)", (double)hi);
+        std::string r = b;
+        std::snprintf(b, sizeof(b), "(%af)", (double)lo);
+        return std::make_pair(r, std::string(b));
+    };
+    std::string hdr;
+    {
+        char b[512];
+        std::snprintf(b, sizeof(b),
+                      "#define W %uu\n#define H %uu\n#define NEXP %uu\n#define CC %lldL\n#define TG %uu\n#define NH %uu\n",
+                      W, H, n, cc, TGc, NH);
+        hdr = b;
+        hdr += "#define WSTAGES " + stages(W, "STW") + "\n";
+        hdr += "#define HSTAGES " + stages(H, "STH") + "\n";
+        const double kv[6] = {std::sqrt(0.5), std::cos(2 * PI / 5), std::cos(4 * PI / 5), std::sin(2 * PI / 5),
+                              std::sin(4 * PI / 5), std::sqrt(3.0) / 2};
+        const char* kn[6] = {"K_SQRT1_2", "K_C1", "K_C2", "K_S1", "K_S2", "K_S3"};
+        for (int i = 0; i < 6; ++i) {
+            auto p = dfc(kv[i]);
+            hdr += std::string("#define ") + kn[i] + "_HI " + p.first + "\n";
+            hdr += std::string("#define ") + kn[i] + "_LO " + p.second + "\n";
+        }
+    }
+    std::string src = hdr + ss.str();
     const char* s = src.c_str();
     cl_program prog = clCreateProgramWithSource(ctx, 1, &s, nullptr, &err);
     CHECK(err);
     char opts[1024];
-    const char* extra = std::getenv("PRP2_OPTS");
-    std::snprintf(opts, sizeof(opts),
-                  "-D W=%u -D H=%u -D LOGW=%u -D LOGH=%u -D LOGL=%d -D NEXP=%uu -D CC=%lldL -D WSPLIT=%u -D TG=%u %s",
-                  W, H, logW, logH, logL, n, cc, (unsigned)((logL + 1) / 2), TGc, extra ? extra : "");
+    const char* extra = std::getenv("PRP_OPTS");
+    std::snprintf(opts, sizeof(opts), "%s", extra ? extra : "");
     if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         size_t len;
         clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
@@ -164,26 +221,38 @@ int main(int argc, char** argv) {
     cl_kernel kTM = clCreateKernel(prog, "tailMul", &err); CHECK(err);
     cl_kernel kI = clCreateKernel(prog, "invW", &err); CHECK(err);
 
-    // ---- tables
-    std::vector<cplx> twW(W), twH(H), twN1(W), twN2(H);
-    for (uint32_t i = 0; i < W; ++i) { twW[i] = root(i, W); twN1[i] = root(i, NC); }
-    for (uint32_t i = 0; i < H; ++i) { twH[i] = root(i, H); twN2[i] = root((uint64_t)W * i, NC); }
-    const uint32_t WSPLIT = (logL + 1) / 2;
-    const size_t TS = (size_t)1 << WSPLIT;
-    std::vector<double> WTAB(8 * TS, 1.0);
+    // ---- tables (double-float)
+    struct cdf { float a, b, c, d; };
+    auto tocdf = [](cplx v) {
+        float rh = (float)v.x, ih = (float)v.y;
+        return cdf{rh, (float)(v.x - rh), ih, (float)(v.y - ih)};
+    };
+    std::vector<cdf> twW(W), twH(H), twN1(W), twN2(H);
+    for (uint32_t i = 0; i < W; ++i) { twW[i] = tocdf(root(i, W)); twN1[i] = tocdf(root(i, NC)); }
+    for (uint32_t i = 0; i < H; ++i) { twH[i] = tocdf(root(i, H)); twN2[i] = tocdf(root((uint64_t)W * i, NC)); }
+    const uint32_t WSn = 512;
+    std::vector<float> WTAB(2 * (2 * NH + 2 * WSn), 0.f);
+    std::vector<uint32_t> ITAB(2 * NH + 2 * WSn, 0);
     {
         const double log2c = std::log2((double)cc);
-        for (size_t i = 0; i < TS; ++i) {
-            double a = (double)i / (double)L;                    // 2^(r_lo/L)
-            double b = (double)(i << WSPLIT) / (double)L;        // 2^(r_hi 2^S / L)
-            if (i < TS) { WTAB[i] = std::exp2(a); WTAB[4 * TS + i] = std::exp2(-a); }
-            if ((i << WSPLIT) < L) { WTAB[TS + i] = std::exp2(b); WTAB[5 * TS + i] = std::exp2(-b); }
-            WTAB[2 * TS + i] = std::exp2(a * log2c);
-            WTAB[6 * TS + i] = std::exp2(-a * log2c);
-            if ((i << WSPLIT) < L) {
-                WTAB[3 * TS + i] = std::exp2(b * log2c);
-                WTAB[7 * TS + i] = std::exp2(-b * log2c) / (double)NC;
-            }
+        auto put = [&](size_t idx, double v) { float hi = (float)v; WTAB[2 * idx] = hi; WTAB[2 * idx + 1] = (float)(v - hi); };
+        for (uint32_t jh = 0; jh < NH; ++jh) {
+            uint64_t x = (uint64_t)n * jh * WSn;
+            uint64_t r = x % L, f = x / L;
+            ITAB[jh] = (uint32_t)r;
+            ITAB[NH + WSn + jh] = (uint32_t)f;
+            double wv = std::exp2(-(double)r / (double)L + (double)jh * WSn * log2c / (double)L);
+            put(jh, wv);
+            put(NH + WSn + jh, 1.0 / (wv * (double)NC));
+        }
+        for (uint32_t jl = 0; jl < WSn; ++jl) {
+            uint64_t x = (uint64_t)n * jl;
+            uint64_t r = x % L, f = x / L;
+            ITAB[NH + jl] = (uint32_t)r;
+            ITAB[2 * NH + WSn + jl] = (uint32_t)f;
+            double wv = std::exp2(-(double)r / (double)L + (double)jl * log2c / (double)L);
+            put(NH + jl, wv);
+            put(2 * NH + WSn + jl, 1.0 / wv);
         }
     }
 
@@ -195,7 +264,8 @@ int main(int argc, char** argv) {
     };
     cl_mem bTwW = mk(16 * W, twW.data()), bTwH = mk(16 * H, twH.data());
     cl_mem bTwN1 = mk(16 * W, twN1.data()), bTwN2 = mk(16 * H, twN2.data());
-    cl_mem bWT = mk(8 * WTAB.size(), WTAB.data()), bIWT = bWT;
+    cl_mem bWT = mk(4 * WTAB.size(), WTAB.data()), bIWT = bWT;
+    cl_mem bIT = mk(4 * ITAB.size(), ITAB.data());
     cl_mem bA = mk(16 * NC, nullptr), bA2 = mk(16 * NC, nullptr);
     uint32_t zero = 0;
     cl_mem bErr = mk(4, &zero);
@@ -236,6 +306,8 @@ int main(int argc, char** argv) {
     clSetKernelArg(kI, 5, sizeof(cl_mem), &bTwN1);
     clSetKernelArg(kI, 6, sizeof(cl_mem), &bTwN2);
     clSetKernelArg(kI, 8, sizeof(cl_mem), &bErr);
+    clSetKernelArg(kI, 9, sizeof(cl_mem), &bIT);
+    clSetKernelArg(kF, 7, sizeof(cl_mem), &bIT);
 
     const size_t WGS = 64;
     const size_t gF = (size_t)H * WGS, gT = (size_t)(W / (2 * TGc)) * WGS, gI = (size_t)H * WGS;
@@ -312,7 +384,7 @@ int main(int argc, char** argv) {
 
     // ---- canonical residue (host): X = sum d_j 2^B_j + sum CY_m 2^B_(2m+2), reduced into [0, N)
     const size_t K = (n + 31) / 32 + 1;
-    auto Bj = [&](uint64_t j) { return ((uint64_t)n * j + L - 1) >> logL; };
+    auto Bj = [&](uint64_t j) { return ((uint64_t)n * j + L - 1) / L; };
     auto canon = [&](Num a) {
         CHECK(clEnqueueReadBuffer(q, a.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
         CHECK(clEnqueueReadBuffer(q, a.CY, CL_TRUE, 0, 8 * NC, CYh.data(), 0, nullptr, nullptr));
@@ -333,7 +405,8 @@ int main(int argc, char** argv) {
                 uint64_t m = h + (uint64_t)H * w, p = (uint64_t)h * W + w;
                 addAt(Bj(2 * m), Dh[2 * p]);
                 addAt(Bj(2 * m + 1), Dh[2 * p + 1]);
-                addAt(Bj(2 * m + 2), CYh[p]);
+                addAt(Bj(2 * m + 2), (int32_t)(uint32_t)(CYh[p] & 0xFFFFFFFFll));
+                addAt(Bj(2 * m + 4), (int32_t)(CYh[p] >> 32));
             }
         std::vector<uint32_t> limb(K, 0);
         int64_t top = 0;
@@ -444,7 +517,7 @@ int main(int argc, char** argv) {
     // so with d_s = prod_{u<=s} y_u (one y every B iterations): d_s == y_0 * d_(s-1)^(2^B).
     const long long G = (long long)n - 41;
     char ckname[128];
-    std::snprintf(ckname, sizeof(ckname), "prp2_%u_%lld.ckpt", n, cc);
+    std::snprintf(ckname, sizeof(ckname), "prp_%u_%lld.ckpt", n, cc);
     long long it = 0;
     auto saveCk = [&](long long iter) {
         CHECK(clEnqueueReadBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
@@ -452,7 +525,7 @@ int main(int argc, char** argv) {
         std::string tmp = std::string(ckname) + ".tmp";
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) return;
-        uint64_t hdr[4] = {n, (uint64_t)cc, (uint64_t)logL, (uint64_t)iter};
+        uint64_t hdr[4] = {n, (uint64_t)cc, (uint64_t)L, (uint64_t)iter};
         std::fwrite(hdr, 8, 4, f);
         std::fwrite(Dh.data(), 4, Dh.size(), f);
         std::fwrite(CYh.data(), 8, CYh.size(), f);
@@ -465,7 +538,7 @@ int main(int argc, char** argv) {
         if (f) {
             uint64_t hdr[4];
             if (std::fread(hdr, 8, 4, f) == 4 && hdr[0] == n && hdr[1] == (uint64_t)cc &&
-                hdr[2] == (uint64_t)logL && std::fread(Dh.data(), 4, Dh.size(), f) == Dh.size() &&
+                hdr[2] == (uint64_t)L && std::fread(Dh.data(), 4, Dh.size(), f) == Dh.size() &&
                 std::fread(CYh.data(), 8, CYh.size(), f) == CYh.size()) {
                 CHECK(clEnqueueWriteBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
                 CHECK(clEnqueueWriteBuffer(q, X.CY, CL_TRUE, 0, 8 * NC, CYh.data(), 0, nullptr, nullptr));

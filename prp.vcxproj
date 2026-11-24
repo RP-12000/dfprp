@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- prp2: FP64 weighted real FFT -->
+<!-- prp: double-float weighted FFT PRP -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -14,8 +14,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{808DBDAC-73B5-4A67-9687-4E054F6D40A3}</ProjectGuid>
-    <RootNamespace>prp2</RootNamespace>
+    <ProjectGuid>{A3BF287F-7328-404F-BB14-9B7351391826}</ProjectGuid>
+    <RootNamespace>prp</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -35,7 +35,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="..\GpuPRP.props" />
+    <Import Project="GpuPRP.props" />
   </ImportGroup>
   <PropertyGroup>
     <LocalDebuggerCommandArguments>20011 -nogec</LocalDebuggerCommandArguments>
@@ -62,10 +62,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="prp2.cpp" />
+    <ClCompile Include="prp.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <CopyFileToFolders Include="prp2.cl">
+    <CopyFileToFolders Include="prp.cl">
       <DestinationFolders>$(OutDir)</DestinationFolders>
       <FileType>Document</FileType>
     </CopyFileToFolders>
