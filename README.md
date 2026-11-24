@@ -1,7 +1,7 @@
-# GpuPRP
+# dfprp
 
 GPU Fermat PRP test (base 3, the same residue Prime95 reports for "PRP-3, residue-type 1") for N = 2^n − c,
-in OpenCL. The program is `dfprp` (double-float PRP). Open `GpuPRP.slnx` in Visual Studio 2026, or run `build.bat` (Release by default).
+in OpenCL; dfprp = double-float PRP. Open `dfprp.slnx` in Visual Studio 2026, or run `build.bat` (Release by default).
 
 ## How it works
 

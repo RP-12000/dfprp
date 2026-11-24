@@ -1,5 +1,5 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<!-- Shared settings for all GpuPRP projects: OpenCL headers/library from vcpkg, output folders. -->
+<!-- Shared settings for dfprp: OpenCL headers/library from vcpkg, output folders. -->
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup Label="UserMacros">
     <VcpkgInstalled Condition="'$(VcpkgInstalled)' == ''">C:\Users\kelvi\vcpkg\installed\x64-windows</VcpkgInstalled>
