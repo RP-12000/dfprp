@@ -93,6 +93,8 @@ int main(int argc, char** argv) {
     while (W > 2 && NC / W < 2) W >>= 1;
     const uint32_t H = (uint32_t)(NC / W);
     const uint32_t logW = ilog2(W), logH = ilog2(H);
+    uint32_t TGc = std::getenv("PRP2_TG") ? (uint32_t)std::atoi(std::getenv("PRP2_TG")) : 2;
+    while (TGc > 1 && (2 * TGc * H > 1024 || 2 * TGc > W / 2)) TGc >>= 1;
     std::printf("n=%u c=%lld  L=%llu (2^%d real, %.3f bits/word)  W=%u H=%u\n", n, cc,
                 (unsigned long long)L, logL, (double)n / L, W, H);
 
@@ -146,8 +148,8 @@ int main(int argc, char** argv) {
     char opts[1024];
     const char* extra = std::getenv("PRP2_OPTS");
     std::snprintf(opts, sizeof(opts),
-                  "-D W=%u -D H=%u -D LOGW=%u -D LOGH=%u -D LOGL=%d -D NEXP=%uu -D CC=%lldL -D WSPLIT=%u %s",
-                  W, H, logW, logH, logL, n, cc, (unsigned)((logL + 1) / 2), extra ? extra : "");
+                  "-D W=%u -D H=%u -D LOGW=%u -D LOGH=%u -D LOGL=%d -D NEXP=%uu -D CC=%lldL -D WSPLIT=%u -D TG=%u %s",
+                  W, H, logW, logH, logL, n, cc, (unsigned)((logL + 1) / 2), TGc, extra ? extra : "");
     if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         size_t len;
         clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
@@ -236,7 +238,7 @@ int main(int argc, char** argv) {
     clSetKernelArg(kI, 8, sizeof(cl_mem), &bErr);
 
     const size_t WGS = 64;
-    const size_t gF = (size_t)H * WGS, gT = (size_t)(W / 2) * WGS, gI = (size_t)H * WGS;
+    const size_t gF = (size_t)H * WGS, gT = (size_t)(W / (2 * TGc)) * WGS, gI = (size_t)H * WGS;
     cl_mem curF = nullptr, curFout = nullptr, curI = nullptr;
     int curMul = -1;
     bool profNow = false;

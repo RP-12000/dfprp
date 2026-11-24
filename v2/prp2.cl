@@ -21,8 +21,15 @@ typedef double2 T2;
 #endif
 #ifdef HACK_NOFFT
 #define FFT_LDS(a, b, P, lP, nb, tw, d) (a)
-#else
+#elif defined(OLDFFT)
 #define FFT_LDS fft_lds
+#else
+#define FFT_LDS(a, b, P, lP, nb, tw, d) fft_ip(a, P, lP, nb, tw, d)
+#endif
+#ifdef OLDFFT
+#define LDS2(name, sz) __local T2 name[sz]
+#else
+#define LDS2(name, sz) __local T2* name = 0
 #endif
 
 inline T2 cmul(T2 a, T2 b) { return (T2)(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x)); }
@@ -68,9 +75,58 @@ inline void dft8(T2* x, int dir) {
     for (int q = 0; q < 4; ++q) { x[q] = e[q] + o[q]; x[q + 4] = e[q] - o[q]; }
 }
 
+// In-place variant: one LDS buffer, each thread keeps its butterflies in registers between a read
+// phase and a write phase (radix fixed per branch so register arrays are statically indexed).
+#define FFT_STAGE(LR, PER)                                                                     \
+    {                                                                                          \
+        const uint R = 1u << LR, nbf = P >> LR, tot = nb * nbf;                                \
+        T2 x[PER][1 << LR];                                                                    \
+        _Pragma("unroll") for (uint u = 0; u < PER; ++u) {                                     \
+            const uint g = t + u * WG;                                                         \
+            if (g < tot) {                                                                     \
+                const uint arr = g >> (logP - LR), i = g & (nbf - 1);                          \
+                _Pragma("unroll") for (uint r = 0; r < R; ++r) x[u][r] = a[arr * P + i + r * nbf]; \
+            }                                                                                  \
+        }                                                                                      \
+        barrier(CLK_LOCAL_MEM_FENCE);                                                          \
+        _Pragma("unroll") for (uint u = 0; u < PER; ++u) {                                     \
+            const uint g = t + u * WG;                                                         \
+            if (g < tot) {                                                                     \
+                const uint arr = g >> (logP - LR), i = g & (nbf - 1), k = i & (p - 1);         \
+                if (p > 1) {                                                                   \
+                    const uint stepi = k << (logP - LR - logp);                                \
+                    _Pragma("unroll") for (uint r = 1; r < R; ++r) {                           \
+                        T2 w = tw[(r * stepi) & (P - 1)];                                      \
+                        if (dir < 0) w.y = -w.y;                                               \
+                        x[u][r] = cmul(x[u][r], w);                                            \
+                    }                                                                          \
+                }                                                                              \
+                if (LR == 3) dft8(x[u], dir);                                                  \
+                else if (LR == 2) dft4(x[u], dir);                                             \
+                else dft2(x[u]);                                                               \
+                const uint j = ((i - k) << LR) + k;                                            \
+                _Pragma("unroll") for (uint r = 0; r < R; ++r) a[arr * P + j + r * p] = x[u][r]; \
+            }                                                                                  \
+        }                                                                                      \
+        barrier(CLK_LOCAL_MEM_FENCE);                                                          \
+        p <<= LR;                                                                              \
+        logp += LR;                                                                            \
+    }
+
+// requires nb * P <= 16 * WG
+inline __attribute__((always_inline)) __local T2* fft_ip(__local T2* a, const uint P, const uint logP, const uint nb, __global const T2* tw,
+                   const int dir) {
+    const uint t = get_local_id(0);
+    uint p = 1, logp = 0;
+    while (logP - logp >= 3) FFT_STAGE(3, 2)
+    if (logP - logp == 2) FFT_STAGE(2, 4)
+    if (logP - logp == 1) FFT_STAGE(1, 8)
+    return a;
+}
+
 // Batched Stockham FFT in local memory. nb arrays of length P (log2 P = logP) stored contiguously
 // in a; b is scratch of the same size. tw[j] = exp(-2 pi i j / P). Returns the buffer holding the result.
-__local T2* fft_lds(__local T2* a, __local T2* b, const uint P, const uint logP, const uint nb,
+inline __attribute__((always_inline)) __local T2* fft_lds(__local T2* a, __local T2* b, const uint P, const uint logP, const uint nb,
                     __global const T2* tw, const int dir) {
     const uint t = get_local_id(0);
     uint p = 1, logp = 0;
@@ -126,7 +182,8 @@ inline T2 twN(__global const T2* twN1, __global const T2* twN2, uint e) {
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void fwdW(__global const int2* D, __global const long* CY, __global const double* WT, __global T2* A,
           __global const T2* twW, __global const T2* twN1, __global const T2* twN2) {
-    __local T2 s1[W], s2[W];
+    __local T2 s1[W];
+    LDS2(s2, W);
     const uint h = get_group_id(0), t = get_local_id(0);
     for (uint w = t; w < W; w += WG) {
         const uint pos = h * W + w;
@@ -173,64 +230,77 @@ inline void mulpair(T2* Vk, T2* Vn, T2 Uk, T2 Un, T2 t2) {
 }
 
 // mode 0: square, mode 1: forward column FFT only (A -> A), mode 2: multiply by Bf (already forward)
-inline void tailImpl(__local T2* s1, __local T2* s2, __global T2* A, __global const T2* Bf, __global const T2* twH,
+// A work-group handles TG adjacent columns c = g*TG + i and their partners W - c (column 0's partner
+// slot holds the self-paired column W/2). LDS layout: [2*TG arrays][H].
+inline uint tcol(uint g, uint arr) {
+    uint c = g * TG + (arr < TG ? arr : arr - TG);
+    return arr < TG ? c : (c == 0 ? W / 2 : W - c);
+}
+inline __attribute__((always_inline)) void tailImpl(__local T2* s1, __local T2* s2, __global T2* A, __global const T2* Bf, __global const T2* twH,
                      __global const T2* twN1, __global const T2* twN2, const int mode) {
     const uint g = get_group_id(0), t = get_local_id(0);
-    const uint col1 = g, col2 = g == 0 ? W / 2 : W - g;
-    for (uint i = t; i < 2 * H; i += WG) {
-        uint col = i < H ? col1 : col2;
-        s1[i] = A[TIDX(i & (H - 1), col)];
+    for (uint idx = t; idx < 2 * TG * H; idx += WG) {
+        uint arr = idx % (2 * TG), kh = idx / (2 * TG);
+        s1[arr * H + kh] = A[TIDX(kh, tcol(g, arr))];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local T2* r = FFT_LDS(s1, s2, H, LOGH, 2, twH, 1);
+    __local T2* r = FFT_LDS(s1, s2, H, LOGH, 2 * TG, twH, 1);
     if (mode == 1) {
-        for (uint i = t; i < 2 * H; i += WG) {
-            uint col = i < H ? col1 : col2;
-            A[TIDX(i & (H - 1), col)] = r[i];
+        for (uint idx = t; idx < 2 * TG * H; idx += WG) {
+            uint arr = idx % (2 * TG), kh = idx / (2 * TG);
+            A[TIDX(kh, tcol(g, arr))] = r[arr * H + kh];
         }
         return;
     }
-    __local T2* x1 = r;
-    __local T2* x2 = r + H;
-    // pairs: (arrK, iK) with (arrN, iN), k index for twiddle
-    const uint npairs = g != 0 ? H : H + 1;
-    for (uint u = t; u < npairs; u += WG) {
+    const uint ntask = TG * H + (g == 0 ? 1 : 0);
+    for (uint u = t; u < ntask; u += WG) {
         uint ia, ib, colA, colB, kk;
         __local T2* pa;
         __local T2* pb;
-        if (g != 0) { ia = u; ib = H - 1 - u; pa = x1; pb = x2; colA = col1; colB = col2; kk = col1 + W * u; }
-        else if (u <= H / 2) { ia = u; ib = (H - u) & (H - 1); pa = x1; pb = x1; colA = colB = 0; kk = W * u; }
-        else { ia = u - (H / 2 + 1); ib = H - 1 - ia; pa = x2; pb = x2; colA = colB = W / 2; kk = W / 2 + W * ia; }
+        if (g == 0 && u <= H) {
+            // column 0 self pairs (kh, H-kh), then column W/2 (partner slot 0) pairs (kh, H-1-kh)
+            if (u <= H / 2) { ia = u; ib = (H - u) & (H - 1); pa = pb = r; colA = colB = 0; kk = W * u; }
+            else { ia = u - (H / 2 + 1); ib = H - 1 - ia; pa = pb = r + TG * H; colA = colB = W / 2; kk = W / 2 + W * ia; }
+        } else {
+            uint uu = g == 0 ? u - 1 : u;  // skip the extra task of group 0
+            uint i = uu / H, kh = uu % H;
+            uint c = g * TG + i;
+            ia = kh; ib = H - 1 - kh;
+            pa = r + i * H; pb = r + (TG + i) * H;
+            colA = c; colB = W - c; kk = c + W * kh;
+        }
         T2 a = pa[ia], b = pb[ib];
         T2 tw2 = twN(twN1, twN2, kk);
         if (mode == 0) sqpair(&a, &b, tw2);
-        else mulpair(&a, &b, Bf[ia * W + colA], Bf[ib * W + colB], tw2);
+        else mulpair(&a, &b, Bf[TIDX(ia, colA)], Bf[TIDX(ib, colB)], tw2);
         pa[ia] = a;
         if (!(pa == pb && ia == ib)) pb[ib] = b;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local T2* other = r == s1 ? s2 : s1;
-    r = FFT_LDS(r, other, H, LOGH, 2, twH, -1);
-    for (uint i = t; i < 2 * H; i += WG) {
-        uint col = i < H ? col1 : col2;
-        A[TIDX(i & (H - 1), col)] = r[i];
+    r = FFT_LDS(r, s2, H, LOGH, 2 * TG, twH, -1);
+    for (uint idx = t; idx < 2 * TG * H; idx += WG) {
+        uint arr = idx % (2 * TG), kh = idx / (2 * TG);
+        A[TIDX(kh, tcol(g, arr))] = r[arr * H + kh];
     }
 }
 
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void tail(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2) {
-    __local T2 s1[2 * H], s2[2 * H];
+    __local T2 s1[2 * TG * H];
+    LDS2(s2, 2 * TG * H);
     tailImpl(s1, s2, A, A, twH, twN1, twN2, 0);
 }
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void tailFwd(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2) {
-    __local T2 s1[2 * H], s2[2 * H];
+    __local T2 s1[2 * TG * H];
+    LDS2(s2, 2 * TG * H);
     tailImpl(s1, s2, A, A, twH, twN1, twN2, 1);
 }
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void tailMul(__global T2* A, __global const T2* twH, __global const T2* twN1, __global const T2* twN2,
              __global const T2* Bf) {
-    __local T2 s1[2 * H], s2[2 * H];
+    __local T2 s1[2 * TG * H];
+    LDS2(s2, 2 * TG * H);
     tailImpl(s1, s2, A, Bf, twH, twN1, twN2, 2);
 }
 
@@ -238,7 +308,8 @@ __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void invW(__global const T2* A, __global int2* D, __global long* CY, __global const double* IWT,
           __global const T2* twW, __global const T2* twN1, __global const T2* twN2, const int mulc,
           __global uint* maxerr) {
-    __local T2 s1[W], s2[W];
+    __local T2 s1[W];
+    LDS2(s2, W);
     __local uint lerr;
     const uint h = get_group_id(0), t = get_local_id(0);
     if (t == 0) lerr = 0;
