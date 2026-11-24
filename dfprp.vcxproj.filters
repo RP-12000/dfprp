@@ -11,12 +11,12 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="prp.cpp">
+    <ClCompile Include="dfprp.cpp">
       <Filter>Host</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <CopyFileToFolders Include="prp.cl">
+    <CopyFileToFolders Include="dfprp.cl">
       <Filter>OpenCL Kernels</Filter>
     </CopyFileToFolders>
   </ItemGroup>

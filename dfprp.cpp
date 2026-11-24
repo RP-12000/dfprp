@@ -1,11 +1,11 @@
-// prp: GPU Fermat PRP (base 3) for N = 2^n - c. Weighted real FFT (the DWT weights 2^(ceil(nj/L)-nj/L) * c^(j/L)
+// dfprp: GPU Fermat PRP (base 3) for N = 2^n - c. Weighted real FFT (the DWT weights 2^(ceil(nj/L)-nj/L) * c^(j/L)
 // fold 2^n == c into the transform, so no zero padding), computed entirely in double-float arithmetic
 // (pairs of FP32, ~48-bit mantissa) because consumer GPUs (T4, Radeon iGPUs) have very slow FP64.
 // FFT length L = 2^k, 3*2^k or 5*2^k; Gerbicz error check; checkpoint/resume.
-// usage: prp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
+// usage: dfprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
 //        [-inject it] [-dev i]
-// env:   PRP_LM=m (with -L k: length m*2^k), PRP_W (line width, default 512), PRP_TG (tail columns per group),
-//        PRP_OPTS (extra OpenCL build options)
+// env:   DFPRP_LM=m (with -L k: length m*2^k), DFPRP_W (line width, default 512), DFPRP_TG (tail columns per group),
+//        DFPRP_OPTS (extra OpenCL build options)
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 
@@ -63,7 +63,7 @@ static uint32_t ilog2(uint64_t v) { uint32_t l = 0; while ((1ull << l) < v) ++l;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: prp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
+        std::printf("usage: dfprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -93,10 +93,10 @@ int main(int argc, char** argv) {
         else if (a == "-fresh") resume = false;
         else { std::fprintf(stderr, "bad arg %s\n", a.c_str()); return 1; }
     }
-    // candidate lengths L = m * 2^k, m in {1, 3, 5}; -L k forces 2^k, or m*2^k with PRP_LM=m
+    // candidate lengths L = m * 2^k, m in {1, 3, 5}; -L k forces 2^k, or m*2^k with DFPRP_LM=m
     uint64_t L = 0;
     {
-        const char* lm = std::getenv("PRP_LM");
+        const char* lm = std::getenv("DFPRP_LM");
         if (logL) L = (uint64_t)(lm ? std::atoi(lm) : 1) << logL;
         else {
             for (uint64_t cand = 64;; ++cand) {
@@ -109,10 +109,10 @@ int main(int argc, char** argv) {
         }
     }
     const uint64_t NC = L / 2;
-    uint32_t W = std::getenv("PRP_W") ? (uint32_t)std::atoi(std::getenv("PRP_W")) : 512;
+    uint32_t W = std::getenv("DFPRP_W") ? (uint32_t)std::atoi(std::getenv("DFPRP_W")) : 512;
     while (W > 2 && (NC % W != 0 || NC / W < 2)) W >>= 1;
     const uint32_t H = (uint32_t)(NC / W);
-    uint32_t TGc = std::getenv("PRP_TG") ? (uint32_t)std::atoi(std::getenv("PRP_TG")) : 1;
+    uint32_t TGc = std::getenv("DFPRP_TG") ? (uint32_t)std::atoi(std::getenv("DFPRP_TG")) : 1;
     while (TGc > 1 && (2 * TGc * H > 1024 || 2 * TGc > W / 2)) TGc >>= 1;
     std::printf("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u  [double-float]\n", n, cc,
                 (unsigned long long)L, (double)n / L, W, H);
@@ -168,8 +168,8 @@ int main(int argc, char** argv) {
     std::string exe_dir = argv[0];
     auto pos = exe_dir.find_last_of("\\/");
     exe_dir = pos == std::string::npos ? "" : exe_dir.substr(0, pos + 1);
-    std::ifstream kf(exe_dir + "prp.cl");
-    if (!kf) { std::fprintf(stderr, "cannot open prp.cl\n"); return 1; }
+    std::ifstream kf(exe_dir + "dfprp.cl");
+    if (!kf) { std::fprintf(stderr, "cannot open dfprp.cl\n"); return 1; }
     std::stringstream ss;
     ss << kf.rdbuf();
     const uint32_t NH = (uint32_t)(L / 512 + 2);
@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
     cl_program prog = clCreateProgramWithSource(ctx, 1, &s, nullptr, &err);
     CHECK(err);
     char opts[1024];
-    const char* extra = std::getenv("PRP_OPTS");
+    const char* extra = std::getenv("DFPRP_OPTS");
     std::snprintf(opts, sizeof(opts), "%s", extra ? extra : "");
     if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         size_t len;
@@ -517,7 +517,7 @@ int main(int argc, char** argv) {
     // so with d_s = prod_{u<=s} y_u (one y every B iterations): d_s == y_0 * d_(s-1)^(2^B).
     const long long G = (long long)n - 41;
     char ckname[128];
-    std::snprintf(ckname, sizeof(ckname), "prp_%u_%lld.ckpt", n, cc);
+    std::snprintf(ckname, sizeof(ckname), "dfprp_%u_%lld.ckpt", n, cc);
     long long it = 0;
     auto saveCk = [&](long long iter) {
         CHECK(clEnqueueReadBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));

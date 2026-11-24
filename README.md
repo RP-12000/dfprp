@@ -1,7 +1,7 @@
 # GpuPRP
 
 GPU Fermat PRP test (base 3, the same residue Prime95 reports for "PRP-3, residue-type 1") for N = 2^n − c,
-in OpenCL. Open `GpuPRP.slnx` in Visual Studio 2026, or run `build.bat` (Release by default).
+in OpenCL. The program is `dfprp` (double-float PRP). Open `GpuPRP.slnx` in Visual Studio 2026, or run `build.bat` (Release by default).
 
 ## How it works
 
@@ -11,14 +11,14 @@ in OpenCL. Open `GpuPRP.slnx` in Visual Studio 2026, or run `build.bat` (Release
   Consumer GPUs such as the T4 and the Radeon 780M run FP64 at 1/32 of FP32, so this is the fastest variant there.
   The lower precision means ~12.2 bits per word, so n ≈ 4M uses L = 320K (5·2^16).
 * Four-step FFT, W = 512 lines × H columns, three kernels per squaring (`fwdW`, `tail`, `invW`), two-level lazy
-  carries, Gerbicz error check every B² iterations (B = 1000), checkpoint file `prp_<n>_<c>.ckpt`.
+  carries, Gerbicz error check every B² iterations (B = 1000), checkpoint file `dfprp_<n>_<c>.ckpt`.
 
-`prp.exe` loads `prp.cl` from its own folder at run time; the project copies it to `bin\<Configuration>\`.
+`dfprp.exe` loads `dfprp.cl` from its own folder at run time; the project copies it to `bin\<Configuration>\`.
 
 ## Running
 
 ```
-prp n [c=25] [-iters k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-report k] [-inject it] [-maxbits b] [-dev i]
+dfprp n [c=25] [-iters k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-report k] [-inject it] [-maxbits b] [-dev i]
 ```
 
 * No `-iters`: full PRP test with Gerbicz check, resumable from the checkpoint.

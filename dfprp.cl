@@ -1,4 +1,4 @@
-// prp: weighted real FFT mod 2^n - c (four-step W x H, three kernels), where every
+// dfprp: weighted real FFT mod 2^n - c (four-step W x H, three kernels), where every
 // floating-point value is a "double-float": an unevaluated sum hi + lo of two FP32 numbers (~48-bit mantissa).
 // Complex values are float4 (re.hi, re.lo, im.hi, im.lo). L = 2*W*H need not be a power of two (H may carry a
 // factor 3 or 5). Compile-time constants: W, H, LOGW, NEXP, CC, TG, NH (weight table rows), WSTAGES, HSTAGES,

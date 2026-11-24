@@ -4,7 +4,7 @@
     <BuildType Name="Release" />
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="prp.vcxproj" />
+  <Project Path="dfprp.vcxproj" />
   <Folder Name="/Solution Items/">
     <File Path="README.md" />
     <File Path="GpuPRP.props" />
