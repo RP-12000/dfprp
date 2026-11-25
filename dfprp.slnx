@@ -2,7 +2,7 @@
   <Configurations>
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="dfprp.vcxproj" Id="a3bf287f-7328-404f-bb14-9b7351391826" />
+  <Project Path="hyprp.vcxproj" Id="4e281c13-7c37-4238-8673-007c70dd86f4" />
   <Folder Name="/Solution Items/">
     <File Path=".gitignore" />
     <File Path="build.bat" />

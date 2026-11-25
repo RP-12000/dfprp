@@ -1,44 +1,87 @@
 # dfprp
 
-GPU Fermat PRP test (base 3, the same residue Prime95 reports for "PRP-3, residue-type 1") for N = 2^n − c,
-in OpenCL; dfprp = double-float PRP. Open `dfprp.slnx` in Visual Studio 2026, or run `build.bat` (Release by default).
+**All Purpose k·b^n+c PRP tester on GPU.** Version 1.0, developed on 2026.11.25 (the program prints this first).
+
+The GPU program is `hyprp` (FP32 + M31 hybrid FFT): a Fermat PRP test, base 3, with the same residue Prime95
+reports for "PRP-3, residue-type 1". It runs through CUDA on NVIDIA GPUs (when built with `-DHYPRP_CUDA`) and
+through OpenCL on every other GPU. Open `dfprp.slnx` in Visual Studio 2026, or run `build.bat` (Release by default;
+the Windows build uses OpenCL).
+
+**Supported so far:** k = 1, b = 2: N = 2^n − c with c > 0 a square mod 2^31 − 1 (hyprp checks this at the start;
+tested with c = 25), n up to 34,603,008. Other k, b and +c are not implemented yet.
 
 ## How it works
 
-* Weighted real FFT: digit j has weight 2^(⌈nj/L⌉ − nj/L) · c^(j/L), which folds 2^n ≡ c into the transform,
-  so a plain cyclic convolution of length L gives x² mod (2^n − c) with no zero padding (same idea as Prime95).
-* Every floating-point value is a double-float (an unevaluated sum of two FP32 numbers, ~48-bit mantissa).
-  Consumer GPUs such as the T4 and the Radeon 780M run FP64 at 1/32 of FP32, so this is the fastest variant there.
-  The lower precision means ~12.2 bits per word, so n ≈ 4M uses L = 320K (5·2^16).
+* Weighted real FFT: digit j has weight 2^(⌈nj/L⌉ − nj/L) · c^(j/L), which folds 2^n ≡ c into the transform, so a
+  plain cyclic convolution of length L gives x² mod (2^n − c) with no zero padding (same idea as Prime95).
+* Every transform is done twice in one pass: in plain FP32 (approximate) and exactly in GF(p²), p = 2^31 − 1 (a
+  complex-like NTT, i² = −1). The exact convolution value is z = r + p·round((z_fp32 − r)/p) with r = z mod p from
+  the NTT, so the FP32 part only has to be within ±p/2 and words hold up to ~17.5 bits.
+* GF(p) facts used: 2^31 = 1, so powers of two are 31-bit rotations (1/2 = 2^30, 1/√2 = 2^15); 2 and 25 have odd
+  order, so the DWT weights 2^(k/L) and 25^(j/L) exist. Lengths are powers of two (25 has no 3rd or 7th roots and
+  GF(p²) has no 5th roots of unity).
 * Four-step FFT, W = 512 lines × H columns, three kernels per squaring (`fwdW`, `tail`, `invW`), two-level lazy
-  carries, Gerbicz error check every B² iterations (B = 1000), checkpoint file `dfprp_<n>_<c>.ckpt`.
+  carries, Gerbicz error check every B² iterations (B = 1000), checkpoint file `hyprp_<n>_<c>.ckpt`. Round-off
+  above 0.42 inside a Gerbicz block makes that block be redone.
+* Digits are stored as 16-bit pairs while every digit fits (n ≤ 16 L), else 32-bit. The carry out of an element
+  (about bits/word + log2(c) + 13 bits) is split into a part for the next element and a part for the one after,
+  packed into one 64-bit word per element (8 bytes, whatever the word size).
+* `hyprp.cl` is written so it compiles as OpenCL C and as CUDA C++ (NVRTC); `gpu_backend.h` has the two backends.
 
-`dfprp.exe` loads `dfprp.cl` from its own folder at run time; the project copies it to `bin\<Configuration>\`.
+`hyprp.exe` loads `hyprp.cl` from its own folder at run time; the project copies it to `bin\<Configuration>\`.
+
+## FFT lengths
+
+The length is the smallest power of two whose bits/word stay under the limit below. The limits come from round-off
+surveys on a Kaggle T4 and a Radeon 780M (two or three n per point) and give a worst maxerr of about 0.27 at each
+cutoff. n within 32 of a multiple of L/4 (more round-off) takes the next length.
+
+| FFT length | bits/word | largest n |
+|---|---|---|
+| ≤ 128K | 17.7 | 2,319,974 (128K) |
+| 256K | 17.45 | 4,574,412 |
+| 512K | 17.2 | 9,017,753 |
+| 1024K | 16.95 | 17,773,363 |
+| 2048K | 16.5 | 34,603,008 |
+
+Larger n (longer lengths were not measured) are refused.
 
 ## Running
 
 ```
-dfprp n [c=25] [-iters k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-report k] [-inject it] [-maxbits b] [-dev i]
+hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-dev i]
+hyprp -bench [-dev i] [-quick] [-out file.json]
 ```
 
-* No `-iters`: full PRP test with Gerbicz check, resumable from the checkpoint.
-* `-iters k -report k -prof`: benchmark k squarings and print per-kernel times.
+* Every line hyprp prints starts with the UTC time and a level (INFO, WARN, FATAL), as in Mass Prime Siever's log:
+  `2026-11-25 06:18:45 UTC+0 [INFO] RES64 7490970688C5F822`.
+* No `-iters`: full PRP test with Gerbicz check, resumable from the checkpoint (`-fresh` ignores it).
+* `-iters k -report k -prof`: time k squarings and print per-kernel times; `-L k` forces the FFT length 2^k.
 * `check.py n [c] [iters]` prints the expected RES64 with Python (small n only).
 * Debug's command line is a self-test: `20011 -nogec` must print RES64 `D6077DAFC085AB4C`.
-* Measure speed with the Release build only, and only while Prime95 is stopped.
+* `HYPRP_BACKEND=opencl` makes a CUDA build use OpenCL on NVIDIA too.
 
-## Numbers on the Radeon 780M (n = 4,000,037)
+## Benchmark and T4-Hours
 
-0.397 ms per iteration, about 26.5 min per 4M-bit number, round-off error 0.03. Earlier variants, now removed
-(still in git history before this commit): FP64 0.452 ms (full n = 3678495 run matched Prime95's res64 and
-res2048), integer NTT over three primes 0.51 ms. After 2000 iterations at n = 4,000,037 all three gave RES64
-146B8A66141B5E63.
+The unit of work is the **T4-Hour: what one Tesla T4 card, running alone, computes in one hour.** `hyprp -bench`
+measures any GPU for every FFT length from 16K to 2048K, in both storage modes a length uses (16-bit digits for
+n ≤ 16 L, 32-bit digits above), at an n inside that mode's range; two rounds, the faster steady-state ms/iter. It
+prints the table, the speed relative to the T4 reference, the T4-Hours a test costs (n × T4 ms/iter of its FFT
+length and storage mode / 3,600,000), and writes a JSON file. Lengths below 16K are not measured: those tests take
+seconds, and their time per iteration is close to the 16K time.
 
 ## Kaggle
 
-`kaggle/dfprp_kaggle.ipynb` clones this repository (https://github.com/RP-12000/dfprp) and runs
-`kaggle/kaggle_run.py`, which builds dfprp with g++ against the NVIDIA OpenCL driver. Upload the notebook with a GPU
-accelerator and Internet on, and pick `MODE = 'selftest'` (build + check + benchmark), `'verify'` (full tests of
-exponents Prime95 already did) or `'run'` (an exponent list; results in `results.jsonl`, checkpoints resume across
-sessions, one queue per GPU). The notebook runs whatever is on GitHub, so push changes before running it.
-The NVIDIA build path has not been tested on real hardware yet.
+`kaggle/hyprp_kaggle.ipynb` clones this repository and runs `kaggle/kaggle_run.py`, which builds hyprp with g++
+(CUDA + NVRTC when the toolkit is there, OpenCL otherwise). Use a GPU T4 x2 accelerator with Internet on and pick
+`MODE = 'selftest'` (build; known residues, including n above 16 bits/word and at 512K; speed of each GPU),
+`'verify'` (full tests of exponents Prime95 already did), `'bench'` (the T4-Hour benchmark, one GPU at a time) or
+`'run'` (an exponent list; results in `results.jsonl`, checkpoints resume across sessions, one queue per GPU).
+The notebook runs whatever is on GitHub, so push changes before running it.
+
+## Speed (one Kaggle T4)
+
+| n | FFT | ms / iteration | per exponent |
+|---|---|---|---|
+| 3,670,849 / 3,677,545 (full tests, matched Prime95) | 256K | 0.126–0.133 | 7.8–8.1 min |
+| 4,000,037 (default settings, both T4s busy) | 256K | 0.112–0.114 | ≈ 7.5 min |

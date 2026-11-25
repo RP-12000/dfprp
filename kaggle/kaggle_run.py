@@ -1,13 +1,16 @@
-# dfprp Kaggle runner: build dfprp from this repository on the Kaggle GPU image and run self-test /
-# verification / PRP tests, one exponent queue per GPU, resuming checkpoints and results from earlier notebook
-# versions under /kaggle/input.  Called by kaggle/dfprp_kaggle.ipynb:
-#   python kaggle/kaggle_run.py --mode selftest|verify|run [--c 25] [--exponents 3600029,3600061] [--hours 11.5]
-import argparse, glob, json, os, re, shutil, subprocess, sys, threading, time
+# Kaggle runner for hyprp (GPU Fermat PRP of 2^n - c, FP32 + M31 hybrid FFT).
+# Builds hyprp on the Kaggle GPU image (with the CUDA backend when the CUDA toolkit is there, OpenCL otherwise) and
+# runs a self-test, a verification against Prime95, the T4-Hour benchmark, or a list of exponents (one queue per
+# GPU), resuming checkpoints and results from earlier notebook versions under /kaggle/input.
+# Called by kaggle/hyprp_kaggle.ipynb:
+#   python kaggle/kaggle_run.py --mode selftest|verify|bench|run [--c 25] [--exponents 3600029,3600061] [--hours 11.5]
+import argparse, glob, json, os, re, shutil, subprocess, threading, time
 
 WORK = '/kaggle/working'
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = '/kaggle/temp/dfprp-build'
-EXE = os.path.join(BUILD, 'dfprp')
+BUILD = '/kaggle/temp/hyprp-build'
+PROG = 'hyprp'
+EXE = os.path.join(BUILD, PROG)
 
 KNOWN = {  # Prime95 30.19 PRP-3 residue-type 1 results for 2^n - 25 (from the project's results.json.txt)
     3678495: 'ABC15849A0B8657C',
@@ -15,6 +18,14 @@ KNOWN = {  # Prime95 30.19 PRP-3 residue-type 1 results for 2^n - 25 (from the p
     3678855: 'C2A776E50ADE26FA',
     3670849: '6809CE838AE81EF9',
 }
+# RES64 after 3000 iterations, computed with dfprp (an independent double-float FFT program): checks hyprp above
+# 16 bits/word (32-bit digits) and at 512K words
+CROSS = {4200013: '7490970688C5F822', 4500013: '386AEF1A83E0FA7C', 4574401: '15011123C7996836',
+         9000013: '6B4A2A630EE28A6F'}
+PROGRESS_EVERY = 60   # seconds between progress lines
+RUNNING = []          # live hyprp processes, killed on Ctrl+C
+STOP = threading.Event()
+lock = threading.Lock()
 
 
 def sh(cmd, check=True):
@@ -25,9 +36,28 @@ def sh(cmd, check=True):
     return r.stdout.strip()
 
 
+def cuda_flags():
+    """compiler/linker flags for hyprp's CUDA backend (driver API + NVRTC), or None"""
+    inc = sh("for d in /usr/local/cuda/include /usr/local/cuda-*/include /usr/include; do "
+             "[ -f $d/cuda.h ] && [ -f $d/nvrtc.h ] && echo $d && break; done", False)
+    nvrtc = sh("find /usr/local/cuda/ /usr/local/cuda-*/ /usr/lib/x86_64-linux-gnu -name 'libnvrtc.so*' "
+               "2>/dev/null | grep -v builtins | sort | head -1", False)
+    # the driver's own libcuda (Kaggle mounts it with the other NVIDIA driver libraries), else the toolkit's stub
+    cuda = sh("for f in /usr/local/nvidia/lib64/libcuda.so.1 /usr/lib64-nvidia/libcuda.so.1 "
+              "/usr/lib/x86_64-linux-gnu/libcuda.so.1; do [ -f $f ] && echo $f && break; done", False) or \
+        sh("ldconfig -p | grep -o '/[^ ]*libcuda.so.1' | head -1", False) or \
+        sh("find /usr/local/cuda/ /usr/local/cuda-*/ -path '*stubs/libcuda.so' 2>/dev/null | head -1", False)
+    print('CUDA headers   :', inc or 'NOT FOUND')
+    print('libnvrtc       :', nvrtc or 'NOT FOUND')
+    print('libcuda        :', cuda or 'NOT FOUND')
+    if not (inc and nvrtc and cuda):
+        return None
+    rp = os.path.dirname(nvrtc) + ('' if 'stubs' in cuda else ':' + os.path.dirname(cuda))
+    return f'-DHYPRP_CUDA -I{inc} {nvrtc} {cuda} -Wl,-rpath,{rp}'
+
+
 def build():
     os.makedirs(BUILD, exist_ok=True)
-    shutil.copy(os.path.join(REPO, 'dfprp.cl'), BUILD)  # dfprp loads its kernel from the exe's folder
     hdr = sh("find /usr/local/cuda/ /usr/include /usr/local/include -path '*CL/cl.h' 2>/dev/null | head -1", False)
     lib = sh("find /usr/local/cuda/ /usr/lib/x86_64-linux-gnu -name 'libOpenCL.so*' 2>/dev/null | sort | head -1", False)
     nvcl = sh("ldconfig -p | grep -o '/[^ ]*libnvidia-opencl.so.1' | head -1", False) or \
@@ -47,9 +77,21 @@ def build():
         open(icd, 'w').write(nvcl + '\n')
         print('wrote', icd)
     inc = os.path.dirname(os.path.dirname(hdr))
-    sh(f'g++ -O2 -std=c++17 -DCL_USE_DEPRECATED_OPENCL_1_1_APIS -DCL_USE_DEPRECATED_OPENCL_1_2_APIS '
-       f'-I{inc} {REPO}/dfprp.cpp -o {EXE} {lib}')
-    print('built', EXE)
+    shutil.copy(os.path.join(REPO, PROG + '.cl'), BUILD)  # hyprp loads its kernel from the exe's folder
+    cmd = (f'g++ -O2 -std=c++17 -DCL_USE_DEPRECATED_OPENCL_1_1_APIS -DCL_USE_DEPRECATED_OPENCL_1_2_APIS '
+           f'-I{inc} {REPO}/{PROG}.cpp -o {EXE} {lib}')
+    cf = cuda_flags()
+    built = False
+    if cf:
+        r = subprocess.run(cmd + ' ' + cf, shell=True, text=True, capture_output=True)
+        if r.returncode == 0:
+            built = True
+            print('built', EXE, '(CUDA on NVIDIA, OpenCL otherwise)')
+        else:
+            print('CUDA build of hyprp failed, building it with OpenCL only:\n' + (r.stdout + r.stderr)[-3000:])
+    if not built:
+        sh(cmd)
+        print('built', EXE, '(OpenCL)')
     print(sh('nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv', False))
 
 
@@ -60,6 +102,12 @@ def gpu_count():
         return 1
 
 
+def msg(line):
+    """a hyprp output line without its 'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ' time stamp"""
+    m = re.match(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\+0 \[\w+\] ', line)
+    return line[m.end():] if m else line
+
+
 def parse(log):
     res64 = re.search(r'RES64 ([0-9A-F]{16})', log)
     res2048 = re.search(r'RES2048 ([0-9A-F]+)', log)
@@ -67,11 +115,6 @@ def parse(log):
     ms = re.search(r'\(([0-9.]+) ms/iter', log)
     return (res64.group(1) if res64 else None, res2048.group(1) if res2048 else None,
             verdict.group(1) if verdict else None, float(ms.group(1)) if ms else None)
-
-
-RUNNING = []          # live dfprp processes, killed on Ctrl+C
-STOP = threading.Event()
-PROGRESS_EVERY = 60   # seconds between progress lines
 
 
 def last_progress(path):
@@ -105,20 +148,51 @@ def run_one(dev, n, c, args, cwd, logname, deadline):
     return open(path).read(), time.time() - t0
 
 
+def tail(log, k=12):
+    return '\n'.join('    ' + l for l in (log or '(no output: timed out)').strip().splitlines()[-k:])
+
+
 def selftest(c):
-    log, _ = run_one(0, 20011, 25, ['-nogec'], f'{WORK}/selftest', 'n20011.log', None)
-    r = parse(log)
-    print('n=20011 RES64', r[0], 'OK' if r[0] == 'D6077DAFC085AB4C' else 'WRONG (expected D6077DAFC085AB4C)')
+    """known residues on GPU 0, then the speed of every GPU (the backend hyprp uses here: CUDA on NVIDIA)"""
+    # full test with Gerbicz checks (small n)
+    log, _ = run_one(0, 20011, 25, ['-fresh', '-B', '30'], f'{WORK}/selftest', 'n20011.log', time.time() + 120)
+    be = re.search(r'\| (CUDA|OpenCL)', log or '')
+    print('backend:', be.group(1) if be else '?')
+    r = parse(log or '')[0]
+    print(f'n=20011 RES64 {r}', 'OK' if r == 'D6077DAFC085AB4C' else 'WRONG (expected D6077DAFC085AB4C)')
+    if r != 'D6077DAFC085AB4C':
+        print(tail(log))
+    # above 16 bits/word (32-bit digits) and at 512K, against an independent program's results
+    for n, want in CROSS.items():
+        log, _ = run_one(0, n, 25, ['-iters', '3000', '-report', '3000'], f'{WORK}/selftest', f'x{n}.log',
+                         time.time() + 120)
+        r = parse(log or '')[0]
+        opt = re.search(r'options: ([^\n]+)', log or '')
+        print(f'n={n} 3000 iterations RES64 {r}', 'OK' if r == want else f'WRONG (expected {want})',
+              f'[{opt.group(1)}]' if opt else '')
     for dev in range(gpu_count()):
-        log, _ = run_one(dev, 4000037, c, ['-iters', '20000', '-report', '20000', '-prof'],
-                         f'{WORK}/selftest', f'bench_gpu{dev}.log', None)
+        log, _ = run_one(dev, 4000037, c, ['-iters', '20000', '-report', '20000', '-prof'], f'{WORK}/selftest',
+                         f'speed_gpu{dev}.log', time.time() + 120)
         print(f'--- GPU {dev}, n=4000037, 20000 iterations')
-        for line in log.splitlines():
-            if line.startswith(('n=', 'device', 'plain', 'kernel', 'RES64')):
+        for line in (log or '').splitlines():
+            if msg(line).startswith(('n=', 'device', 'options', 'plain', 'kernel', 'RES64')):
                 print(line)
-        ms = parse(log)[3]
+        ms = parse(log or '')[3]
         if ms:
             print(f'GPU {dev}: {ms:.4f} ms/iter -> about {ms * 4_000_000 / 60000:.1f} min per 4M-bit exponent')
+        else:
+            print(tail(log))
+
+
+def bench_all():
+    """hyprp -bench on every GPU, one GPU at a time (1 T4-Hour = what one T4 card computes in one hour);
+    JSON results in /kaggle/working"""
+    os.makedirs(WORK, exist_ok=True)
+    for dev in range(gpu_count()):
+        cmd = [EXE, '-bench', '-dev', str(dev), '-out', f'{WORK}/hyprp_bench_gpu{dev}.json']
+        r = subprocess.run(cmd, cwd=WORK, text=True, capture_output=True, timeout=1800)
+        print(f'===== GPU {dev}')
+        print('\n'.join(l for l in (r.stdout + r.stderr).splitlines() if not msg(l).startswith('round ')), flush=True)
 
 
 def restore():
@@ -135,16 +209,13 @@ def restore():
     with open(f'{WORK}/results.jsonl', 'w') as out:
         for d in done.values():
             out.write(json.dumps(d) + '\n')
-    for f in glob.glob('/kaggle/input/**/dfprp_*.ckpt', recursive=True):
+    for f in glob.glob(f'/kaggle/input/**/{PROG}_*.ckpt', recursive=True):
         dst = os.path.join(WORK, 'ckpt', os.path.basename(f))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not os.path.exists(dst):
             shutil.copy(f, dst)
     print(f'restored {len(done)} results and {len(glob.glob(WORK + "/ckpt/*.ckpt"))} checkpoints')
     return done
-
-
-lock = threading.Lock()
 
 
 def worker(dev, queue, c, deadline, done):
@@ -157,7 +228,7 @@ def worker(dev, queue, c, deadline, done):
         if (n, -c) in done:
             continue
         print(f'[GPU {dev}] start n={n}', flush=True)
-        log, secs = run_one(dev, n, c, ['-report', '250000'], ck, f'dfprp_{n}.log', deadline)
+        log, secs = run_one(dev, n, c, ['-report', '250000'], ck, f'{PROG}_{n}.log', deadline)
         if log is None:
             why = 'stopped' if STOP.is_set() else 'time limit'
             print(f'[GPU {dev}] {why}: n={n} interrupted, its checkpoint (saved every 1M iterations) is kept',
@@ -167,10 +238,11 @@ def worker(dev, queue, c, deadline, done):
         if not res64 or not verdict:
             print(f'[GPU {dev}] n={n} failed:\n' + log[-2000:], flush=True)
             continue
+        be = re.search(r'\| (CUDA|OpenCL)', log)
         d = {'n': n, 'k': 1, 'b': 2, 'c': -c, 'worktype': 'PRP-3', 'residue-type': 1,
              'status': 'P' if verdict.startswith('a probable') else 'C', 'res64': res64, 'res2048': res2048,
-             'program': 'dfprp', 'gpu': dev, 'seconds': round(secs, 1), 'ms_per_iter': ms,
-             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}
+             'program': PROG, 'backend': be.group(1) if be else None, 'gpu': dev, 'seconds': round(secs, 1),
+             'ms_per_iter': ms, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}
         known = KNOWN.get(n) if c == 25 else None
         if known:
             d['prime95_res64'] = known
@@ -186,13 +258,17 @@ def worker(dev, queue, c, deadline, done):
 
 def main(mode, exponents, c, hours):
     t_start = time.time()
-    # dfprp processes left over from an interrupted run would fight over the GPU and the checkpoint files
-    if subprocess.run(['pkill', '-f', EXE], capture_output=True).returncode == 0:
-        print('stopped dfprp processes left over from an earlier run (they resume from their checkpoints)')
+    # processes left over from an interrupted run would fight over the GPU and the checkpoint files
+    if subprocess.run(['pkill', '-f', BUILD + '/'], capture_output=True).returncode == 0:
+        print('stopped hyprp processes left over from an earlier run (they resume from their checkpoints)')
         time.sleep(2)
     build()
     if mode == 'selftest':
         selftest(c)
+        return
+    if mode == 'bench':
+        bench_all()
+        print(f'benchmark finished in {time.time() - t_start:.0f} s')
         return
     if mode == 'verify':
         exponents = sorted(KNOWN)[:gpu_count()] if c == 25 else exponents
@@ -201,7 +277,7 @@ def main(mode, exponents, c, hours):
     ngpu = gpu_count()
     deadline = t_start + hours * 3600
     print(f'{len(queue)} exponents to test on {ngpu} GPU(s); stopping at {hours} h')
-    print(f'progress every {PROGRESS_EVERY} s; full logs in {WORK}/ckpt/dfprp_<n>.log', flush=True)
+    print(f'progress every {PROGRESS_EVERY} s; full logs in {WORK}/ckpt/{PROG}_<n>.log', flush=True)
     ts = [threading.Thread(target=worker, args=(dev, queue, c, deadline, done), daemon=True)
           for dev in range(ngpu)]
     for t in ts:
@@ -215,14 +291,14 @@ def main(mode, exponents, c, hours):
             p.kill()
         for t in ts:
             t.join(10)
-        print('interrupted: dfprp stopped; run again to resume from the checkpoints')
+        print('interrupted: tests stopped; run again to resume from the checkpoints')
         return
     print(f'finished: {len(done)} results in {WORK}/results.jsonl, {len(queue)} exponents not started')
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['selftest', 'verify', 'run'], default='selftest')
+    ap.add_argument('--mode', choices=['selftest', 'verify', 'bench', 'run'], default='selftest')
     ap.add_argument('--c', type=int, default=25)
     ap.add_argument('--exponents', default='', help='comma or space separated list of n')
     ap.add_argument('--hours', type=float, default=11.5)

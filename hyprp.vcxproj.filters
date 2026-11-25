@@ -16,6 +16,14 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="gpu_backend.h">
+      <Filter>Host</Filter>
+    </ClInclude>
+    <ClInclude Include="logline.h">
+      <Filter>Host</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
     <CopyFileToFolders Include="hyprp.cl">
       <Filter>OpenCL Kernels</Filter>
     </CopyFileToFolders>

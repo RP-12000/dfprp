@@ -1,14 +1,11 @@
-// hyprp: GPU Fermat PRP (base 3) for N = 2^n - c. Same weighted real FFT as dfprp, but each transform is done
+// hyprp: GPU Fermat PRP (base 3) for N = 2^n - c, with a weighted real FFT (IBDWT) where each transform is done
 // twice in one pass: in plain FP32 (approximate) and exactly over GF(p^2), p = 2^31 - 1 (M31). The exact
 // convolution value is rebuilt from the M31 residue and the FP32 approximation, so ~16-18 bits per word fit.
-// FFT length L = 2^k. Gerbicz error check; checkpoint/resume; same command line and output as dfprp.
-// usage: hyprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
-//        [-inject it] [-dev i]
-// env:   HYPRP_W (line width, default 512), HYPRP_TG (tail columns per group, default 2), HYPRP_WG (work-group size,
-//        default 128; W=512 TG=2 WG=128 was fastest on Kaggle T4), HYPRP_OPTS (extra OpenCL build options), HYPRP_NOFFT=1 (timing diagnostic)
-#define CL_TARGET_OPENCL_VERSION 120
-#include <CL/cl.h>
-
+// FFT length L = 2^k. Gerbicz error check; checkpoint/resume.
+// usage: hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]
+//        hyprp -bench [-dev i] [-quick] [-out file.json]
+// env:   HYPRP_BACKEND=opencl (use OpenCL even on NVIDIA when built with HYPRP_CUDA)
+// build: OpenCL only, or add -DHYPRP_CUDA and link -lcuda -lnvrtc to run on NVIDIA GPUs through CUDA
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,15 +18,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <memory>
 
-#define CHECK(e)                                                                    \
-    do {                                                                            \
-        cl_int _e = (e);                                                            \
-        if (_e != CL_SUCCESS) {                                                     \
-            std::fprintf(stderr, "OpenCL error %d at line %d\n", _e, __LINE__);     \
-            std::exit(1);                                                           \
-        }                                                                           \
-    } while (0)
+#include "gpu_backend.h"
 
 struct cplx { double x, y; };
 static const double PI = 3.14159265358979323846;
@@ -103,9 +94,171 @@ static int64_t invmod(int64_t a, int64_t m) {  // a^-1 mod m, gcd(a, m) = 1
 
 static uint32_t ilog2(uint64_t v) { uint32_t l = 0; while ((1ull << l) < v) ++l; return l; }
 
+// largest bits/word for FFT length 2^k (see the length choice in main); 0 = length not supported
+static double maxBitsFor(uint32_t k) {
+    return k <= 17 ? 17.7 : k == 18 ? 17.45 : k == 19 ? 17.2 : k == 20 ? 16.95 : k == 21 ? 16.5 : 0;
+}
+// n within 32 of a multiple of L/4: more round-off, the next length is used
+static bool nearFraction(uint64_t n, uint64_t L) {
+    if (L < 4096) return false;
+    const uint64_t q = L / 4, r = n % q;
+    return r < 32 || q - r < 32;
+}
+
+// ---- benchmark: hyprp -bench [-dev i] [-quick] [-out file]
+// Measures this GPU for every FFT length 16K..2048K. Within one length the time per iteration depends on how digits
+// are stored, which depends on n:
+//   mode 0: 16-bit digits   n <= 16 L
+//   mode 1: 32-bit digits   16 L < n <= the length's cutoff
+// so each (length, mode) is measured at an n inside its range, by running this program with -L k, two rounds, taking
+// the faster ms/iter of the last quarter of each run (steady state). Prints a table, the speed relative to a Tesla T4
+// and the T4-Hours a test costs, and writes JSON. Lengths below 16K are not measured: their tests take seconds, and
+// the time per iteration there is close to the 16K time. Works on any GPU hyprp runs on (CUDA or OpenCL).
+// Unit of work: 1 T4-Hour = what one Tesla T4 card (running alone) computes in one hour. A test of n costs
+// n * T4_REF[length][mode] / 3.6e6 T4-Hours; a GPU's speed in T4-Hours per hour is its "x T4" score.
+// T4 reference ms/iter for 2^14 .. 2^21 words, modes 0..1: Kaggle Tesla T4 (CUDA backend, driver 580.178.04),
+// mean of the two T4s of one session, each running alone, 2026-11-25 (hyprp -bench).
+static const double T4_REF[8][2] = {{0.0226, 0.02275}, {0.0254, 0.0253}, {0.0345, 0.03495}, {0.0591, 0.0592},
+                                    {0.1115, 0.1129},  {0.26245, 0.2671}, {0.6413, 0.64455}, {1.32285, 1.3281}};
+static const char* const BENCH_MODE[2] = {"16-bit digits", "32-bit digits"};
+
+static int runBench(int argc, char** argv) {
+    int dev = 0;
+    bool quick = false;
+    std::string out;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-dev" && i + 1 < argc) dev = std::atoi(argv[++i]);
+        else if (a == "-quick") quick = true;
+        else if (a == "-out" && i + 1 < argc) out = argv[++i];
+        else { logFatal("bad arg %s", a.c_str()); return 1; }
+    }
+    if (out.empty()) out = "hyprp_bench_dev" + std::to_string(dev) + ".json";
+    const double scale = quick ? 0.25 : 1.0;
+    const uint32_t K0 = 14, K1 = 21;
+    const long long baseIters[8] = {24000, 18000, 12000, 9000, 6000, 3000, 1600, 800};
+    struct Row { uint32_t k, mode; uint64_t L, n, nFrom, nTo; double ms[2]; double best; double maxerr; std::string opts; };
+    std::vector<Row> rows;
+    for (uint32_t k = K0; k <= K1; ++k) {
+        const uint64_t L = 1ull << k;
+        const uint64_t top = (uint64_t)((double)L * maxBitsFor(k));
+        const uint64_t lo = (k > 6) ? (uint64_t)((double)(L / 2) * maxBitsFor(k - 1)) + 1 : 1;  // smallest n using L
+        const uint64_t edges[3] = {lo, 16 * L + 1, top + 1};
+        for (uint32_t mode = 0; mode < 2; ++mode) {
+            const uint64_t from = std::max(edges[mode], lo), to = std::min(edges[mode + 1] - 1, top);
+            if (from > to) continue;
+            uint64_t n = mode == 1 ? to : from + (to - from) * 3 / 4;  // inside the range, away from its edges
+            if (n % 2 == 0) --n;
+            while (nearFraction(n, L) || n > to) n -= 2;
+            rows.push_back(Row{k, mode, L, n, from, to, {0, 0}, 0, 0, ""});
+        }
+    }
+    std::string device = "?";
+    std::string exe = argv[0];
+    for (int round = 0; round < 2; ++round) {
+        for (auto& r : rows) {
+            const long long it = std::max<long long>(200, (long long)(baseIters[r.k - K0] * scale)) / 4 * 4;
+            char cmd[2048];
+#ifdef _WIN32
+            std::snprintf(cmd, sizeof(cmd), "\"\"%s\" %llu -L %u -iters %lld -report %lld -dev %d 2>&1\"", exe.c_str(),
+                          (unsigned long long)r.n, r.k, it, it / 4, dev);
+            FILE* f = _popen(cmd, "r");
+#else
+            std::snprintf(cmd, sizeof(cmd), "\"%s\" %llu -L %u -iters %lld -report %lld -dev %d 2>&1", exe.c_str(),
+                          (unsigned long long)r.n, r.k, it, it / 4, dev);
+            FILE* f = popen(cmd, "r");
+#endif
+            if (!f) { logFatal("cannot start %s", exe.c_str()); return 1; }
+            char line[4096];
+            double last = 0, err = 0;
+            std::string log;
+            while (std::fgets(line, sizeof(line), f)) {
+                log += line;
+                std::string s = logMessage(line);  // without the time stamp
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+                if (s.rfind("device:", 0) == 0) device = s.substr(8);
+                if (s.rfind("options:", 0) == 0) r.opts = s.substr(9);
+                double ms, e;
+                long long a, b;
+                if (std::sscanf(s.c_str(), "plain iter %lld/%lld %lf ms/iter maxerr %lf", &a, &b, &ms, &e) == 4) {
+                    last = ms;
+                    err = std::max(err, e);
+                }
+            }
+#ifdef _WIN32
+            _pclose(f);
+#else
+            pclose(f);
+#endif
+            if (last <= 0) {
+                logFatal("FFT %lluK n=%llu failed:", (unsigned long long)(r.L >> 10), (unsigned long long)r.n);
+                std::fputs(log.c_str(), stderr);
+                return 1;
+            }
+            r.ms[round] = last;
+            r.maxerr = std::max(r.maxerr, err);
+            logInfo("round %d  FFT %5lluK  n=%-9llu %9.4f ms/iter  [%s]", round + 1, (unsigned long long)(r.L >> 10),
+                    (unsigned long long)r.n, last, r.opts.c_str());
+        }
+    }
+    for (auto& r : rows) r.best = std::min(r.ms[0], r.ms[1]);
+    bool haveRef = true;
+    for (auto& r : rows) haveRef = haveRef && T4_REF[r.k - K0][r.mode] > 0;
+    logInfo("hyprp benchmark  device: %s", device.c_str());
+    logInfo("  FFT    n range                 test n      ms/iter (2 rounds)   best     %s mode",
+            haveRef ? " x T4  T4-Hours/test " : "");
+    double lsum = 0;
+    for (auto& r : rows) {
+        char row[256], ref4[64] = "";
+        if (haveRef) {
+            const double ref = T4_REF[r.k - K0][r.mode], rel = ref / r.best;
+            lsum += std::log(rel);
+            std::snprintf(ref4, sizeof(ref4), "  %5.2f  %10.4f", rel, (double)r.n * ref / 3.6e6);
+        }
+        std::snprintf(row, sizeof(row), "  %5lluK %9llu..%-9llu  %9llu  %8.4f %8.4f  %8.4f%s   %s",
+                      (unsigned long long)(r.L >> 10), (unsigned long long)r.nFrom, (unsigned long long)r.nTo,
+                      (unsigned long long)r.n, r.ms[0], r.ms[1], r.best, ref4, BENCH_MODE[r.mode]);
+        logInfo("%s", row);
+    }
+    const double score = haveRef ? std::exp(lsum / rows.size()) : 0;
+    if (haveRef)
+        logInfo("overall: %.3f x Tesla T4 (geometric mean over all lengths and modes) = %.3f T4-Hours per hour on this GPU",
+                score, score);
+    else logInfo("overall: T4 reference not set yet (these numbers become it when measured on a T4)");
+    FILE* j = std::fopen(out.c_str(), "w");
+    if (j) {
+        std::string dv;
+        for (char ch : device) { if (ch == '"' || ch == '\\') dv += '\\'; dv += ch; }
+        std::fprintf(j, "{\n  \"program\": \"hyprp\",\n  \"c\": 25,\n  \"device\": \"%s\",\n  \"t4_relative\": %.4f,\n",
+                     dv.c_str(), score);
+        std::fprintf(j, "  \"modes\": [\"%s\", \"%s\"],\n", BENCH_MODE[0], BENCH_MODE[1]);
+        std::fprintf(j, "  \"points\": [\n");
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const Row& r = rows[i];
+            const double ref = T4_REF[r.k - K0][r.mode];
+            std::fprintf(j,
+                         "    {\"fft\": %llu, \"mode\": %u, \"n_from\": %llu, \"n_to\": %llu, \"test_n\": %llu, "
+                         "\"ms_per_iter\": %.5f, \"rounds\": [%.5f, %.5f], \"maxerr\": %.4f, \"t4_ms_per_iter\": %.5f}%s\n",
+                         (unsigned long long)r.L, r.mode, (unsigned long long)r.nFrom, (unsigned long long)r.nTo,
+                         (unsigned long long)r.n, r.best, r.ms[0], r.ms[1], r.maxerr, ref, i + 1 < rows.size() ? "," : "");
+        }
+        std::fprintf(j, "  ]\n}\n");
+        std::fclose(j);
+        logInfo("wrote %s", out.c_str());
+    }
+    return 0;
+}
+
+static const char* const VERSION = "1.0";
+static const char* const DEVELOPED = "2026.11.25";
+
 int main(int argc, char** argv) {
+    logInfo("Starting dfprp v%s, Developed on %s", VERSION, DEVELOPED);
+    logInfo("All Purpose k*b^n+c PRP tester on GPU");
+    if (argc >= 2 && std::string(argv[1]) == "-bench") return runBench(argc, argv);
     if (argc < 2) {
-        std::printf("usage: hyprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
+        std::printf("usage: hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]\n"
+                    "       hyprp -bench [-dev i] [-quick] [-out file.json]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -115,57 +268,59 @@ int main(int argc, char** argv) {
     int logL = 0;
     long long iters_limit = 0;
     bool prof = false;
-    double maxbits = 17.0;
     int devIdx = 0;
     long long report = 100000;
     int GB = 1000;  // Gerbicz block size (check every GB^2 iterations)
     bool gec = true, resume = true;
-    long long inject = -1;  // test: corrupt one digit at this iteration
     for (; ai < argc; ++ai) {
         std::string a = argv[ai];
         if (a == "-L" && ai + 1 < argc) logL = std::atoi(argv[++ai]);
         else if (a == "-iters" && ai + 1 < argc) iters_limit = std::atoll(argv[++ai]);
         else if (a == "-prof") prof = true;
-        else if (a == "-maxbits" && ai + 1 < argc) maxbits = std::atof(argv[++ai]);
         else if (a == "-dev" && ai + 1 < argc) devIdx = std::atoi(argv[++ai]);
         else if (a == "-report" && ai + 1 < argc) report = std::atoll(argv[++ai]);
         else if (a == "-B" && ai + 1 < argc) GB = std::atoi(argv[++ai]);
         else if (a == "-nogec") gec = false;
-        else if (a == "-inject" && ai + 1 < argc) inject = std::atoll(argv[++ai]);
         else if (a == "-fresh") resume = false;
-        else { std::fprintf(stderr, "bad arg %s\n", a.c_str()); return 1; }
+        else { logFatal("bad arg %s", a.c_str()); return 1; }
     }
-    // candidate lengths L = m * 2^k, m in {1, 3, 5, 9}; -L k forces 2^k, or m*2^k with HYPRP_LM=m
+    // FFT length L = 2^k (M31 has only power-of-two roots here). Largest bits/word for each length, from round-off
+    // surveys on Kaggle T4 (CUDA) and a Radeon 780M (OpenCL), 2-3 n per point, chosen so that the worst maxerr at every
+    // cutoff is about the same (~0.27): 128K and shorter 17.7, 256K 17.45 (n <= 4,574,412), 512K 17.2 (9,017,753),
+    // 1024K 16.95 (17,773,363), 2048K 16.5 (34,603,008); longer lengths were not measured, so larger n are refused.
+    // n just below L * q / 4 (q integer) has an almost periodic digit-width pattern and ~0.05-0.15 more round-off at
+    // the same bits/word, so within 32 of such a point the next length is used. -L k forces L = 2^k (the benchmark).
     uint64_t L = 0;
-    {
-        const char* lm = std::getenv("HYPRP_LM");
-        if (logL) L = (uint64_t)(lm ? std::atoi(lm) : 1) << logL;
-        else {
-            for (uint64_t cand = 64;; ++cand) {
-                uint64_t v = cand;
-                while (v % 2 == 0) v /= 2;
-                if (v != 1) continue;  // M31 has only 2-power roots here
-                if ((cand & (cand - 1)) && cand % 2048) continue;  // need W=512 | L/2 and an even H
-                if ((double)n / (double)cand <= maxbits) { L = cand; break; }
+    if (logL) L = 1ull << logL;
+    else
+        for (uint64_t cand = 64;; cand *= 2) {
+            if (cand > (1u << 21)) { L = cand; break; }  // refused below
+            if ((double)n / (double)cand <= maxBitsFor(ilog2(cand))) {
+                L = nearFraction(n, cand) && cand < (1u << 21) ? 2 * cand : cand;
+                break;
             }
         }
+    if (L > (1u << 21)) {  // longer lengths have not been measured
+        logFatal("n = %u is too large: hyprp handles n up to 34,603,008 (FFT length 2048K)", n);
+        return 2;
     }
+    // four-step layout: W x H complex elements (W = 512 lines, wider when H would pass 1024), TG tail columns per
+    // work-group, WG work-items; W=512 TG=2 WG=128 was the fastest on Kaggle T4
     const uint64_t NC = L / 2;
-    uint32_t W = std::getenv("HYPRP_W") ? (uint32_t)std::atoi(std::getenv("HYPRP_W")) : 512;
-    if (NC % W != 0 || NC / W < 2) W = 512;  // requested width does not fit this length: use the default
+    uint32_t W = 512;
     while (W > 2 && (NC % W != 0 || NC / W < 2)) W >>= 1;
+    while (NC / W > 1024 && NC % (2 * W) == 0) W *= 2;  // tail LDS: 32*TG*H bytes
     const uint32_t H = (uint32_t)(NC / W);
-    uint32_t TGc = std::getenv("HYPRP_TG") ? (uint32_t)std::atoi(std::getenv("HYPRP_TG")) : 2;
+    uint32_t TGc = 2;
     while (TGc > 1 && (2 * TGc * H > 2048 || (W / 2) % TGc)) TGc >>= 1;  // tail LDS = 32 * TG * H bytes
-    const uint32_t WGc = std::getenv("HYPRP_WG") ? (uint32_t)std::atoi(std::getenv("HYPRP_WG")) : 128;
-    std::printf("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u TG=%u WG=%u  [FP32+M31]\n", n, cc,
-                (unsigned long long)L, (double)n / L, W, H, TGc, WGc);
+    const uint32_t WGc = 128;
+    logInfo("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u TG=%u WG=%u  [FP32+M31]", n, cc, (unsigned long long)L,
+            (double)n / L, W, H, TGc, WGc);
+    // radix-8/4/2 Stockham stages of a power-of-two line FFT, as STW(R, PS) / STH(R, PS) items for hyprp.cl
     auto stages = [](uint32_t P, const char* tag) {
         std::string out;
         uint32_t ps = 1, rest = P;
         auto add = [&](uint32_t R) { char b[64]; std::snprintf(b, sizeof(b), "%s(%u,%u) ", tag, R, ps); out += b; ps *= R; rest /= R; };
-        while (rest % 5 == 0) add(5);
-        while (rest % 3 == 0) add(3);
         uint32_t e = 0;
         while ((1u << e) < rest) ++e;
         uint32_t n8 = e / 3, n4 = 0, n2 = 0;
@@ -174,109 +329,62 @@ int main(int argc, char** argv) {
         while (n8--) add(8);
         while (n4--) add(4);
         while (n2--) add(2);
-        if (rest != 1) { std::fprintf(stderr, "unsupported length %u\n", P); std::exit(1); }
+        if (rest != 1) { logFatal("unsupported length %u", P); std::exit(1); }
         return out;
     };
 
-    // ---- OpenCL setup
-    cl_uint np = 0;
-    CHECK(clGetPlatformIDs(0, nullptr, &np));
-    std::vector<cl_platform_id> plats(np);
-    CHECK(clGetPlatformIDs(np, plats.data(), nullptr));
-    std::vector<cl_device_id> devs;
-    for (auto p : plats) {
-        cl_uint nd = 0;
-        if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) != CL_SUCCESS) continue;
-        std::vector<cl_device_id> d(nd);
-        clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, nd, d.data(), nullptr);
-        devs.insert(devs.end(), d.begin(), d.end());
-    }
-    if (devs.empty()) { std::fprintf(stderr, "no GPU\n"); return 1; }
-    cl_device_id dev = devs[std::min<size_t>(devIdx, devs.size() - 1)];
-    {
-        char name[256], ver[256], drv[256];
-        cl_uint cus, clk;
-        cl_ulong lmem, gmem;
-        clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-        clGetDeviceInfo(dev, CL_DEVICE_VERSION, sizeof(ver), ver, nullptr);
-        clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof(drv), drv, nullptr);
-        clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, nullptr);
-        clGetDeviceInfo(dev, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(clk), &clk, nullptr);
-        clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lmem), &lmem, nullptr);
-        clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, nullptr);
-        std::printf("device: %s | %s | driver %s | %u CU @ %u MHz | local %llu KB | global %llu MB\n",
-                    name, ver, drv, cus, clk, (unsigned long long)lmem / 1024,
-                    (unsigned long long)gmem >> 20);
-    }
-    cl_int err;
-    cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
-    CHECK(err);
-    cl_command_queue q =
-        clCreateCommandQueue(ctx, dev, prof ? CL_QUEUE_PROFILING_ENABLE : 0, &err);
-    CHECK(err);
+    // ---- GPU setup: CUDA on NVIDIA (when built with HYPRP_CUDA), OpenCL otherwise
+    std::unique_ptr<Gpu> gpu = makeGpu(devIdx, prof);
     std::string exe_dir = argv[0];
     auto pos = exe_dir.find_last_of("\\/");
     exe_dir = pos == std::string::npos ? "" : exe_dir.substr(0, pos + 1);
     std::ifstream kf(exe_dir + "hyprp.cl");
-    if (!kf) { std::fprintf(stderr, "cannot open hyprp.cl\n"); return 1; }
+    if (!kf) { logFatal("cannot open hyprp.cl"); return 1; }
     std::stringstream ss;
     ss << kf.rdbuf();
     const uint32_t NH = (uint32_t)(L / 512 + 2);
-    auto dfc = [](double v) {
-        float hi = (float)v;
-        float lo = (float)(v - (double)hi);
-        char b[128];
-        std::snprintf(b, sizeof(b), "(%af)", (double)hi);
-        std::string r = b;
-        std::snprintf(b, sizeof(b), "(%af)", (double)lo);
-        return std::make_pair(r, std::string(b));
-    };
+    // digits are stored as 16-bit pairs when every (balanced) digit fits in int16, i.e. n <= 16 L
+    const bool dig16 = (n + L - 1) / L <= 16;
+    const size_t DB = dig16 ? 4 : 8;  // bytes per element of the digit array
+    logInfo("options: digits %s", dig16 ? "16-bit" : "32-bit");
     uint32_t MUc = 0;
     for (uint32_t u = 1; u < 31; ++u) if ((L % 31) * u % 31 == 1) MUc = u;
-    std::string hdr;
     {
         char b[512];
         std::snprintf(b, sizeof(b),
                       "#define W %uu\n#define H %uu\n#define NEXP %uu\n#define CC %lldL\n#define TG %uu\n#define NH %uu\n"
                       "#define WG %u\n#define MU %uu\n#define LOGN %uu\n",
                       W, H, n, cc, TGc, NH, WGc, MUc, ilog2(NC));
-        hdr = b;
-        const bool nofft = std::getenv("HYPRP_NOFFT") != nullptr;  // timing diagnostic only: results are garbage
-        hdr += "#define WSTAGES " + (nofft ? std::string() : stages(W, "STW")) + "\n";
-        hdr += "#define HSTAGES " + (nofft ? std::string() : stages(H, "STH")) + "\n";
-        const double kv[6] = {std::sqrt(0.5), std::cos(2 * PI / 5), std::cos(4 * PI / 5), std::sin(2 * PI / 5),
-                              std::sin(4 * PI / 5), std::sqrt(3.0) / 2};
-        const char* kn[6] = {"K_SQRT1_2", "K_C1", "K_C2", "K_S1", "K_S2", "K_S3"};
-        for (int i = 0; i < 6; ++i) {
-            auto p = dfc(kv[i]);
-            hdr += std::string("#define ") + kn[i] + "_HI " + p.first + "\n";
-            hdr += std::string("#define ") + kn[i] + "_LO " + p.second + "\n";
+        std::string src = b;
+        if (dig16) src += "#define DIG16 1\n";
+        src += "#define WSTAGES " + stages(W, "STW") + "\n";
+        src += "#define HSTAGES " + stages(H, "STH") + "\n";
+        src += ss.str();
+        std::string log;
+        if (!gpu->build(src, log)) {
+            if (gpu->backend == "OpenCL") {
+                logFatal("kernel build failed (OpenCL):");
+                std::fputs(log.c_str(), stderr);
+                return 1;
+            }
+            // e.g. a GPU the installed CUDA toolkit no longer compiles for: the OpenCL driver may still run it
+            logWarn("kernel build failed (%s), falling back to OpenCL:", gpu->backend.c_str());
+            std::fputs(log.c_str(), stdout);
+            gpu.reset(new GpuCL(devIdx, prof));
+            log.clear();
+            if (!gpu->build(src, log)) {
+                logFatal("kernel build failed (OpenCL):");
+                std::fputs(log.c_str(), stderr);
+                return 1;
+            }
         }
     }
-    std::string src = hdr + ss.str();
-    const char* s = src.c_str();
-    cl_program prog = clCreateProgramWithSource(ctx, 1, &s, nullptr, &err);
-    CHECK(err);
-    char opts[1024];
-    const char* extra = std::getenv("HYPRP_OPTS");
-    std::snprintf(opts, sizeof(opts), "%s", extra ? extra : "");
-    if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
-        size_t len;
-        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
-        std::string log(len, 0);
-        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
-        std::fprintf(stderr, "%s\n", log.c_str());
-        return 1;
-    }
-    cl_kernel kF = clCreateKernel(prog, "fwdW", &err); CHECK(err);
-    cl_kernel kT = clCreateKernel(prog, "tail", &err); CHECK(err);
-    cl_kernel kTF = clCreateKernel(prog, "tailFwd", &err); CHECK(err);
-    cl_kernel kTM = clCreateKernel(prog, "tailMul", &err); CHECK(err);
-    cl_kernel kI = clCreateKernel(prog, "invW", &err); CHECK(err);
+    GpuKernel kF = gpu->kernel("fwdW"), kT = gpu->kernel("tail"), kTF = gpu->kernel("tailFwd");
+    GpuKernel kTM = gpu->kernel("tailMul"), kI = gpu->kernel("invW");
 
     // ---- tables: twiddles as (FP32 complex, GF(p^2) element); weights as (FP32 factor, GF(p) factor)
     if (mpow((uint64_t)cc % P31, (P31 - 1) / 2) != 1) {
-        std::fprintf(stderr, "c = %lld is not a square mod 2^31-1: its L-th root does not exist\n", cc);
+        logFatal("c = %lld is not a square mod 2^31-1: its L-th root does not exist", cc);
         return 1;
     }
     const uint32_t KN = ilog2(NC);
@@ -299,7 +407,7 @@ int main(int argc, char** argv) {
         const double log2c = std::log2((double)cc);
         const int64_t half = (int64_t)(P31 - 1) / 2;  // odd; the order of c divides it
         const uint64_t kappa = mpow((uint64_t)cc, (uint64_t)invmod((int64_t)(L % half), half));  // c^(1/L)
-        if (mpow(kappa, L) != (uint64_t)cc % P31) { std::fprintf(stderr, "c^(1/L) failed\n"); return 1; }
+        if (mpow(kappa, L) != (uint64_t)cc % P31) { logFatal("c^(1/L) failed"); return 1; }
         const uint64_t ikappa = mpow(kappa, P31 - 2);
         auto put = [&](size_t idx, double v, uint64_t m) {
             WTAB[2 * idx] = (float)v;
@@ -326,106 +434,104 @@ int main(int argc, char** argv) {
         }
     }
 
-    auto mk = [&](size_t bytes, const void* init) {
-        cl_mem b = clCreateBuffer(ctx, CL_MEM_READ_WRITE | (init ? CL_MEM_COPY_HOST_PTR : 0), bytes,
-                                  (void*)init, &err);
-        CHECK(err);
-        return b;
-    };
-    cl_mem bTwW = mk(16 * W, twW.data()), bTwH = mk(16 * H, twH.data());
-    cl_mem bTwN1 = mk(16 * W, twN1.data()), bTwN2 = mk(16 * H, twN2.data());
-    cl_mem bWT = mk(4 * WTAB.size(), WTAB.data()), bIWT = bWT;
-    cl_mem bIT = mk(4 * ITAB.size(), ITAB.data());
-    cl_mem bA = mk(16 * NC, nullptr), bA2 = mk(16 * NC, nullptr);
+    auto mk = [&](size_t bytes, const void* init) { return gpu->alloc(bytes, init); };
+    GpuBuf bTwW = mk(16 * W, twW.data()), bTwH = mk(16 * H, twH.data());
+    GpuBuf bTwN1 = mk(16 * W, twN1.data()), bTwN2 = mk(16 * H, twN2.data());
+    GpuBuf bWT = mk(4 * WTAB.size(), WTAB.data()), bIWT = bWT;
+    GpuBuf bIT = mk(4 * ITAB.size(), ITAB.data());
+    GpuBuf bA = mk(16 * NC, nullptr), bA2 = mk(16 * NC, nullptr);
     uint32_t zero = 0;
-    cl_mem bErr = mk(4, &zero);
+    GpuBuf bErr = mk(4, &zero);
 
-    struct Num { cl_mem D, CY; };
+    struct Num { GpuBuf D, CY; };
     std::vector<int32_t> Dh(2 * NC, 0);
-    std::vector<int64_t> CYh(NC, 0);
-    auto mkNum = [&]() { return Num{mk(8 * NC, Dh.data()), mk(8 * NC, CYh.data())}; };
+    std::vector<int64_t> CYh(2 * NC, 0);  // host copy of the carries: (low, high) per element, always 64-bit
+    // on the GPU each element's carry is one 64-bit word: lo in bits 24..63, q2 in bits 0..23
+    std::vector<int64_t> CYp(NC);
+    auto readCY = [&](GpuBuf b) {
+        gpu->read(b, 8 * NC, CYp.data());
+        for (size_t i = 0; i < NC; ++i) {
+            CYh[2 * i] = CYp[i] >> 24;
+            CYh[2 * i + 1] = (int64_t)((uint64_t)CYp[i] << 40) >> 40;
+        }
+    };
+    auto writeCY = [&](GpuBuf b, const int64_t* src) {
+        for (size_t i = 0; i < NC; ++i)
+            CYp[i] = (int64_t)(((uint64_t)src[2 * i] << 24) | ((uint64_t)src[2 * i + 1] & 0xFFFFFFull));
+        gpu->write(b, 0, 8 * NC, CYp.data());
+    };
+    // digits on the GPU are int32 or int16 pairs (DB bytes per element); the host always keeps int32 (Dh)
+    std::vector<int16_t> D16(dig16 ? 2 * NC : 0);
+    auto readD = [&](GpuBuf b) {
+        if (!dig16) { gpu->read(b, 8 * NC, Dh.data()); return; }
+        gpu->read(b, 4 * NC, D16.data());
+        for (size_t i = 0; i < 2 * NC; ++i) Dh[i] = D16[i];
+    };
+    auto writeD = [&](GpuBuf b, const int32_t* src) {
+        if (!dig16) { gpu->write(b, 0, 8 * NC, src); return; }
+        for (size_t i = 0; i < 2 * NC; ++i) D16[i] = (int16_t)src[i];
+        gpu->write(b, 0, 4 * NC, D16.data());
+    };
+    auto mkNum = [&]() { return Num{mk(DB * NC, nullptr), mk(8 * NC, nullptr)}; };
     auto setSmall = [&](Num a, int v) {  // a = v (small)
         std::vector<int32_t> d(2 * NC, 0);
-        std::vector<int64_t> cy(NC, 0);
+        std::vector<int64_t> cy(2 * NC, 0);
         d[0] = v;
-        CHECK(clEnqueueWriteBuffer(q, a.D, CL_TRUE, 0, 8 * NC, d.data(), 0, nullptr, nullptr));
-        CHECK(clEnqueueWriteBuffer(q, a.CY, CL_TRUE, 0, 8 * NC, cy.data(), 0, nullptr, nullptr));
+        writeD(a.D, d.data());
+        writeCY(a.CY, cy.data());
     };
     auto copyNum = [&](Num dst, Num src) {
-        CHECK(clEnqueueCopyBuffer(q, src.D, dst.D, 0, 0, 8 * NC, 0, nullptr, nullptr));
-        CHECK(clEnqueueCopyBuffer(q, src.CY, dst.CY, 0, 0, 8 * NC, 0, nullptr, nullptr));
+        gpu->copy(dst.D, src.D, DB * NC);
+        gpu->copy(dst.CY, src.CY, 8 * NC);
     };
     Num X = mkNum(), Dg = mkNum(), Xs = mkNum(), Tg = mkNum();
 
-    for (cl_kernel k : {kT, kTF, kTM}) {
-        clSetKernelArg(k, 1, sizeof(cl_mem), &bTwH);
-        clSetKernelArg(k, 2, sizeof(cl_mem), &bTwN1);
-        clSetKernelArg(k, 3, sizeof(cl_mem), &bTwN2);
+    for (GpuKernel k : {kT, kTF, kTM}) {
+        gpu->setArg(k, 1, bTwH);
+        gpu->setArg(k, 2, bTwN1);
+        gpu->setArg(k, 3, bTwN2);
     }
-    clSetKernelArg(kT, 0, sizeof(cl_mem), &bA);
-    clSetKernelArg(kTF, 0, sizeof(cl_mem), &bA2);
-    clSetKernelArg(kTM, 0, sizeof(cl_mem), &bA);
-    clSetKernelArg(kTM, 4, sizeof(cl_mem), &bA2);
-    clSetKernelArg(kF, 2, sizeof(cl_mem), &bWT);
-    clSetKernelArg(kF, 4, sizeof(cl_mem), &bTwW);
-    clSetKernelArg(kF, 5, sizeof(cl_mem), &bTwN1);
-    clSetKernelArg(kF, 6, sizeof(cl_mem), &bTwN2);
-    clSetKernelArg(kI, 0, sizeof(cl_mem), &bA);
-    clSetKernelArg(kI, 3, sizeof(cl_mem), &bIWT);
-    clSetKernelArg(kI, 4, sizeof(cl_mem), &bTwW);
-    clSetKernelArg(kI, 5, sizeof(cl_mem), &bTwN1);
-    clSetKernelArg(kI, 6, sizeof(cl_mem), &bTwN2);
-    clSetKernelArg(kI, 8, sizeof(cl_mem), &bErr);
-    clSetKernelArg(kI, 9, sizeof(cl_mem), &bIT);
-    clSetKernelArg(kF, 7, sizeof(cl_mem), &bIT);
+    gpu->setArg(kT, 0, bA);
+    gpu->setArg(kTF, 0, bA2);
+    gpu->setArg(kTM, 0, bA);
+    gpu->setArg(kTM, 4, bA2);
+    gpu->setArg(kF, 2, bWT);
+    gpu->setArg(kF, 4, bTwW);
+    gpu->setArg(kF, 5, bTwN1);
+    gpu->setArg(kF, 6, bTwN2);
+    gpu->setArg(kI, 0, bA);
+    gpu->setArg(kI, 3, bIWT);
+    gpu->setArg(kI, 4, bTwW);
+    gpu->setArg(kI, 5, bTwN1);
+    gpu->setArg(kI, 6, bTwN2);
+    gpu->setArg(kI, 8, bErr);
+    gpu->setArg(kI, 9, bIT);
+    gpu->setArg(kF, 7, bIT);
 
     const size_t WGS = WGc;
-    const size_t gF = (size_t)H * WGS, gT = (size_t)(W / (2 * TGc)) * WGS, gI = (size_t)H * WGS;
-    cl_mem curF = nullptr, curFout = nullptr, curI = nullptr;
+    const size_t gF = H, gT = W / (2 * TGc), gI = H;  // work-groups per kernel
+    GpuBuf curF, curFout, curI;
     int curMul = -1;
     bool profNow = false;
     double tF = 0, tT = 0, tI = 0;
     long long nprof = 0;
-    std::vector<std::pair<cl_event, double*>> pend;
-    cl_ulong spanA = 0, spanB = 0;
-    auto flushProf = [&]() {
-        if (pend.empty()) return;
-        clWaitForEvents(1, &pend.back().first);
-        for (auto& pe : pend) {
-            cl_ulong a, b;
-            clGetEventProfilingInfo(pe.first, CL_PROFILING_COMMAND_START, 8, &a, nullptr);
-            clGetEventProfilingInfo(pe.first, CL_PROFILING_COMMAND_END, 8, &b, nullptr);
-            *pe.second += (b - a) * 1e-6;
-            if (!spanA || a < spanA) spanA = a;
-            if (b > spanB) spanB = b;
-            clReleaseEvent(pe.first);
-        }
-        pend.clear();
-    };
-    auto enq = [&](cl_kernel k, size_t g, double* acc) {
-        cl_event e;
-        CHECK(clEnqueueNDRangeKernel(q, k, 1, nullptr, &g, &WGS, 0, nullptr, profNow ? &e : nullptr));
-        if (profNow) {
-            pend.push_back({e, acc});
-            if (pend.size() >= 600) flushProf();
-        }
-    };
-    auto fwd = [&](Num a, cl_mem out) {
-        if (curF != a.D) {
-            clSetKernelArg(kF, 0, sizeof(cl_mem), &a.D);
-            clSetKernelArg(kF, 1, sizeof(cl_mem), &a.CY);
+    auto enq = [&](GpuKernel k, size_t groups, double* acc) { gpu->launch(k, groups, WGS, profNow ? acc : nullptr); };
+    auto fwd = [&](Num a, GpuBuf out) {
+        if (!(curF == a.D)) {
+            gpu->setArg(kF, 0, a.D);
+            gpu->setArg(kF, 1, a.CY);
             curF = a.D;
         }
-        if (curFout != out) { clSetKernelArg(kF, 3, sizeof(cl_mem), &out); curFout = out; }
+        if (!(curFout == out)) { gpu->setArg(kF, 3, out); curFout = out; }
         enq(kF, gF, &tF);
     };
     auto inv = [&](Num a, int mulc) {
-        if (curI != a.D) {
-            clSetKernelArg(kI, 1, sizeof(cl_mem), &a.D);
-            clSetKernelArg(kI, 2, sizeof(cl_mem), &a.CY);
+        if (!(curI == a.D)) {
+            gpu->setArg(kI, 1, a.D);
+            gpu->setArg(kI, 2, a.CY);
             curI = a.D;
         }
-        if (mulc != curMul) { clSetKernelArg(kI, 7, sizeof(int), &mulc); curMul = mulc; }
+        if (mulc != curMul) { gpu->setArg(kI, 7, (int32_t)mulc); curMul = mulc; }
         enq(kI, gI, &tI);
     };
     auto sqr = [&](Num a, int mulc) {  // a = a^2 * mulc
@@ -440,24 +546,14 @@ int main(int argc, char** argv) {
         enq(kTM, gT, &tT);
         inv(a, mulc);
     };
-    cl_event evPrev = nullptr;
-    long long enqCount = 0;
-    auto throttle = [&]() {
-        if ((++enqCount & 255) == 0) {
-            cl_event ev;
-            CHECK(clEnqueueMarker(q, &ev));
-            clFlush(q);
-            if (evPrev) { clWaitForEvents(1, &evPrev); clReleaseEvent(evPrev); }
-            evPrev = ev;
-        }
-    };
+    auto throttle = [&]() { gpu->throttle(); };
 
     // ---- canonical residue (host): X = sum d_j 2^B_j + sum CY_m 2^B_(2m+2), reduced into [0, N)
     const size_t K = (n + 31) / 32 + 1;
     auto Bj = [&](uint64_t j) { return ((uint64_t)n * j + L - 1) / L; };
     auto canon = [&](Num a) {
-        CHECK(clEnqueueReadBuffer(q, a.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
-        CHECK(clEnqueueReadBuffer(q, a.CY, CL_TRUE, 0, 8 * NC, CYh.data(), 0, nullptr, nullptr));
+        readD(a.D);
+        readCY(a.CY);
         std::vector<int64_t> acc(K + 3, 0);
         auto addAt = [&](uint64_t off, int64_t v) {
             size_t i = off >> 5;
@@ -475,8 +571,8 @@ int main(int argc, char** argv) {
                 uint64_t m = h + (uint64_t)H * w, p = (uint64_t)h * W + w;
                 addAt(Bj(2 * m), Dh[2 * p]);
                 addAt(Bj(2 * m + 1), Dh[2 * p + 1]);
-                addAt(Bj(2 * m + 2), (int32_t)(uint32_t)(CYh[p] & 0xFFFFFFFFll));
-                addAt(Bj(2 * m + 4), (int32_t)(CYh[p] >> 32));
+                addAt(Bj(2 * m + 2), CYh[2 * p]);
+                addAt(Bj(2 * m + 4), CYh[2 * p + 1]);
             }
         std::vector<uint32_t> limb(K, 0);
         int64_t top = 0;
@@ -531,36 +627,41 @@ int main(int argc, char** argv) {
     auto tl = t0;
     long long itl = 0, itStart = 0;
     long long todo = total;
+    bool inGec = false, suspect = false;  // round-off above 0.42 inside a Gerbicz block forces that block to be redone
     auto progress = [&](long long done, const char* tag) {
         uint32_t e2 = 0;
-        CHECK(clEnqueueReadBuffer(q, bErr, CL_TRUE, 0, 4, &e2, 0, nullptr, nullptr));
-        CHECK(clEnqueueWriteBuffer(q, bErr, CL_TRUE, 0, 4, &zero, 0, nullptr, nullptr));
+        gpu->read(bErr, 4, &e2);
+        gpu->write(bErr, 0, 4, &zero);
         auto now = std::chrono::steady_clock::now();
         double el = std::chrono::duration<double>(now - t0).count();
         double seg = std::chrono::duration<double>(now - tl).count();
         double msit = done > itl ? 1000.0 * seg / (done - itl) : 0;
-        std::printf("%s iter %lld/%lld  %.4f ms/iter  maxerr %.4f  ETA %.1f min  (elapsed %.1f s)\n", tag,
-                    done, todo, msit, e2 / 4294967295.0, msit * (todo - done) / 60000.0, el);
-        std::fflush(stdout);
+        logInfo("%s iter %lld/%lld  %.4f ms/iter  maxerr %.4f  ETA %.1f min  (elapsed %.1f s)", tag, done, todo, msit,
+                e2 / 4294967295.0, msit * (todo - done) / 60000.0, el);
         tl = now; itl = done;
-        if (e2 / 4294967295.0 > 0.42 && !std::getenv("HYPRP_NOFFT")) {
-            std::fprintf(stderr, "round-off too large\n");
-            std::exit(3);
+        if (e2 / 4294967295.0 > 0.42) {
+            if (inGec) {  // a digit may have been rounded the wrong way: redo the block from the last Gerbicz check
+                logWarn("round-off %.4f too large: the current Gerbicz block will be redone", e2 / 4294967295.0);
+                suspect = true;
+            } else {
+                logFatal("round-off too large");
+                std::exit(3);
+            }
         }
     };
     auto printRes = [&](const std::vector<uint32_t>& limb, bool full) {
         bool isone = limb[0] == 1;
         for (size_t i = 1; i < K && isone; ++i) isone = limb[i] == 0;
         unsigned long long res64 = (unsigned long long)limb[0] | ((unsigned long long)limb[1] << 32);
-        std::printf("RES64 %016llX\n", res64);
+        logInfo("RES64 %016llX", res64);
         std::string r2048;
         for (int i = 63; i >= 0; --i) {
             char b[9];
             std::snprintf(b, sizeof(b), "%08X", i < (int)K ? limb[i] : 0u);
             r2048 += b;
         }
-        std::printf("RES2048 %s\n", r2048.c_str());
-        if (full) std::printf("2^%u-%lld is %s\n", n, cc, isone ? "a probable prime!" : "composite");
+        logInfo("RES2048 %s", r2048.c_str());
+        if (full) logInfo("2^%u-%lld is %s", n, cc, isone ? "a probable prime!" : "composite");
     };
 
     setSmall(X, 3);
@@ -574,13 +675,13 @@ int main(int argc, char** argv) {
             throttle();
             if ((it + 1) % report == 0 || it + 1 == todo) progress(it + 1, "plain");
         }
-        clFinish(q);
-        flushProf();
+        gpu->finish();
+        gpu->flushProf();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("done %lld iterations in %.2f s  (%.4f ms/iter)\n", todo, el, 1000.0 * el / todo);
+        logInfo("done %lld iterations in %.2f s  (%.4f ms/iter)", todo, el, 1000.0 * el / todo);
         if (nprof)
-            std::printf("kernel ms (avg of %lld): fwdW %.4f  tail %.4f  invW %.4f  sum %.4f\n", nprof,
-                        tF / nprof, tT / nprof, tI / nprof, (tF + tT + tI) / nprof);
+            logInfo("kernel ms (avg of %lld): fwdW %.4f  tail %.4f  invW %.4f  sum %.4f", nprof, tF / nprof, tT / nprof,
+                    tI / nprof, (tF + tT + tI) / nprof);
         printRes(canon(X), todo == total);
         return 0;
     }
@@ -593,8 +694,8 @@ int main(int argc, char** argv) {
     std::snprintf(ckname, sizeof(ckname), "hyprp_%u_%lld.ckpt", n, cc);
     long long it = 0;
     auto saveCk = [&](long long iter) {
-        CHECK(clEnqueueReadBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
-        CHECK(clEnqueueReadBuffer(q, X.CY, CL_TRUE, 0, 8 * NC, CYh.data(), 0, nullptr, nullptr));
+        readD(X.D);
+        readCY(X.CY);
         std::string tmp = std::string(ckname) + ".tmp";
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) return;
@@ -613,10 +714,10 @@ int main(int argc, char** argv) {
             if (std::fread(hdr, 8, 4, f) == 4 && hdr[0] == n && hdr[1] == (uint64_t)cc &&
                 hdr[2] == (uint64_t)L && std::fread(Dh.data(), 4, Dh.size(), f) == Dh.size() &&
                 std::fread(CYh.data(), 8, CYh.size(), f) == CYh.size()) {
-                CHECK(clEnqueueWriteBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));
-                CHECK(clEnqueueWriteBuffer(q, X.CY, CL_TRUE, 0, 8 * NC, CYh.data(), 0, nullptr, nullptr));
+                writeD(X.D, Dh.data());
+                writeCY(X.CY, CYh.data());
                 it = (long long)hdr[3];
-                std::printf("resumed from %s at iteration %lld\n", ckname, it);
+                logInfo("resumed from %s at iteration %lld", ckname, it);
             }
             std::fclose(f);
         }
@@ -624,6 +725,7 @@ int main(int argc, char** argv) {
     itl = itStart = it;
     int fails = 0;
     const long long S = (long long)GB * GB;
+    inGec = true;
     while (G - it >= GB) {
         const long long blocks = std::min<long long>(S, G - it) / GB;
         copyNum(Xs, X);
@@ -634,12 +736,6 @@ int main(int argc, char** argv) {
             for (int k = 0; k < GB; ++k, ++j) {
                 sqr(X, 3);
                 throttle();
-                if (j == inject) {
-                    int32_t bad = 12345;
-                    CHECK(clEnqueueWriteBuffer(q, X.D, CL_TRUE, 40, 4, &bad, 0, nullptr, nullptr));
-                    std::printf("injected error at iteration %lld\n", j);
-                    inject = -1;
-                }
                 if ((j + 1) % report == 0) progress(j + 1, "gec");
             }
             if (b == blocks - 1) copyNum(Tg, Dg);  // d_(s-1)
@@ -648,39 +744,48 @@ int main(int argc, char** argv) {
         }
         for (int k = 0; k < GB; ++k) { sqr(Tg, 1); throttle(); }
         mul(Tg, Xs, 3);
-        clFinish(q);
-        bool ok = canon(Tg) == canon(Dg);
+        gpu->finish();
+        {  // round-off since the last progress line (the reset makes the next progress line cover less)
+            uint32_t e2 = 0;
+            gpu->read(bErr, 4, &e2);
+            gpu->write(bErr, 0, 4, &zero);
+            if (e2 / 4294967295.0 > 0.42) {
+                logWarn("round-off %.4f too large before the Gerbicz check: block redone", e2 / 4294967295.0);
+                suspect = true;
+            }
+        }
+        bool ok = !suspect && canon(Tg) == canon(Dg);
+        suspect = false;
         if (ok) {
             it = j;
             saveCk(it);
-            std::printf("Gerbicz check OK at iteration %lld\n", it);
+            logInfo("Gerbicz check OK at iteration %lld", it);
         } else {
             ++fails;
-            std::printf("Gerbicz check FAILED at iteration %lld (fail #%d), rolling back to %lld\n", j,
-                        fails, it);
-            if (fails >= 5) { std::fprintf(stderr, "too many errors\n"); return 4; }
+            logWarn("Gerbicz check FAILED at iteration %lld (fail #%d), rolling back to %lld", j, fails, it);
+            if (fails >= 5) { logFatal("too many errors"); return 4; }
             copyNum(X, Xs);
         }
-        std::fflush(stdout);
     }
     // remaining iterations (< B not covered by GEC, plus the 40 low bits): run twice and compare
+    inGec = false;
     std::vector<uint32_t> r1, r2;
     copyNum(Xs, X);
     bool agreed = false;
     for (int attempt = 0; attempt < 6 && !agreed; ++attempt) {
         if (attempt) copyNum(X, Xs);
         for (long long j = it; j < total; ++j) { sqr(X, mulcOf(j)); throttle(); }
-        clFinish(q);
+        gpu->finish();
         auto r = canon(X);
         if ((!r1.empty() && r == r1) || (!r2.empty() && r == r2)) { r1 = r; agreed = true; }
         else if (r1.empty()) r1 = r;
         else r2 = r;
     }
-    if (!agreed) { std::fprintf(stderr, "final iterations not reproducible\n"); return 5; }
+    if (!agreed) { logFatal("final iterations not reproducible"); return 5; }
     progress(total, "final");
     double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("done %lld iterations in %.2f s (%.4f ms/iter incl. checks)\n", total - itStart, el,
-                1000.0 * el / std::max<long long>(1, total - itStart));
+    logInfo("done %lld iterations in %.2f s (%.4f ms/iter incl. checks)", total - itStart, el,
+            1000.0 * el / std::max<long long>(1, total - itStart));
     printRes(r1, true);
     std::remove(ckname);
     return 0;

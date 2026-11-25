@@ -65,6 +65,10 @@
     <ClCompile Include="hyprp.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="gpu_backend.h" />
+    <ClInclude Include="logline.h" />
+  </ItemGroup>
+  <ItemGroup>
     <CopyFileToFolders Include="hyprp.cl">
       <DestinationFolders>$(OutDir)</DestinationFolders>
       <FileType>Document</FileType>
