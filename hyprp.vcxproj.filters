@@ -2,21 +2,21 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Host">
-      <UniqueIdentifier>{8eb44042-4396-4810-ad29-92b8cadc0dd9}</UniqueIdentifier>
+      <UniqueIdentifier>{3ac14af9-d721-4eb1-b346-d2965efca398}</UniqueIdentifier>
       <Extensions>cpp;h</Extensions>
     </Filter>
     <Filter Include="OpenCL Kernels">
-      <UniqueIdentifier>{f2839418-d355-49ca-928d-0b5cf73ae0d7}</UniqueIdentifier>
+      <UniqueIdentifier>{fcad6739-026d-4717-9f58-67dc1def69b5}</UniqueIdentifier>
       <Extensions>cl</Extensions>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="dfprp.cpp">
+    <ClCompile Include="hyprp.cpp">
       <Filter>Host</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <CopyFileToFolders Include="dfprp.cl">
+    <CopyFileToFolders Include="hyprp.cl">
       <Filter>OpenCL Kernels</Filter>
     </CopyFileToFolders>
   </ItemGroup>

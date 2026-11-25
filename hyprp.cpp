@@ -1,11 +1,11 @@
-// dfprp: GPU Fermat PRP (base 3) for N = 2^n - c. Weighted real FFT (the DWT weights 2^(ceil(nj/L)-nj/L) * c^(j/L)
-// fold 2^n == c into the transform, so no zero padding), computed entirely in double-float arithmetic
-// (pairs of FP32, ~48-bit mantissa) because consumer GPUs (T4, Radeon iGPUs) have very slow FP64.
-// FFT length L = 2^k, 3*2^k or 5*2^k; Gerbicz error check; checkpoint/resume.
-// usage: dfprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
+// hyprp: GPU Fermat PRP (base 3) for N = 2^n - c. Same weighted real FFT as dfprp, but each transform is done
+// twice in one pass: in plain FP32 (approximate) and exactly over GF(p^2), p = 2^31 - 1 (M31). The exact
+// convolution value is rebuilt from the M31 residue and the FP32 approximation, so ~16-18 bits per word fit.
+// FFT length L = 2^k. Gerbicz error check; checkpoint/resume; same command line and output as dfprp.
+// usage: hyprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k]
 //        [-inject it] [-dev i]
-// env:   DFPRP_LM=m (with -L k: length m*2^k), DFPRP_W (line width, default 512), DFPRP_TG (tail columns per group),
-//        DFPRP_OPTS (extra OpenCL build options)
+// env:   HYPRP_W (line width, default 512), HYPRP_TG (tail columns per group, default 2), HYPRP_WG (work-group size,
+//        default 128; W=512 TG=2 WG=128 was fastest on Kaggle T4), HYPRP_OPTS (extra OpenCL build options), HYPRP_NOFFT=1 (timing diagnostic)
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 
@@ -60,11 +60,52 @@ static cplx root(uint64_t j, uint64_t P) {
     return {C, -S};
 }
 
+// ---- GF(p) and GF(p^2), p = 2^31 - 1
+static const uint64_t P31 = 2147483647ull;
+static uint64_t mmod(uint64_t a, uint64_t b) { return (a % P31) * (b % P31) % P31; }
+static uint64_t mpow(uint64_t a, uint64_t e) {
+    uint64_t r = 1;
+    a %= P31;
+    while (e) { if (e & 1) r = mmod(r, a); a = mmod(a, a); e >>= 1; }
+    return r;
+}
+struct G2 { uint64_t re, im; };
+static G2 gmul(G2 a, G2 b) {
+    return G2{(mmod(a.re, b.re) + P31 - mmod(a.im, b.im)) % P31, (mmod(a.re, b.im) + mmod(a.im, b.re)) % P31};
+}
+static G2 gpow(G2 a, uint64_t e) {
+    G2 r{1, 0};
+    while (e) { if (e & 1) r = gmul(r, a); a = gmul(a, a); e >>= 1; }
+    return r;
+}
+static bool geq(G2 a, G2 b) { return a.re == b.re && a.im == b.im; }
+// primitive 2^K-th root of unity g in GF(p^2) with g^(2^(K-3)) = (1 - i)/sqrt2 = (1 - i) 2^15 (so that the
+// radix-4/8 butterflies, written for w^(P/4) = -i, match the tables)
+static G2 m31root(uint32_t K) {
+    const G2 one{1, 0}, t8{32768, P31 - 32768};
+    for (uint64_t a = 2;; ++a) {
+        G2 y = gpow(G2{a, 1}, 1073741823ull);  // (p^2 - 1) / 2^32
+        G2 z = y;
+        for (int i = 0; i < 31; ++i) z = gmul(z, z);
+        if (geq(z, one)) continue;  // y must have order exactly 2^32
+        G2 g = gpow(y, 1ull << (32 - K));
+        G2 w8 = gpow(g, 1ull << (K - 3));
+        for (uint64_t e = 1; e < 8; e += 2)
+            if (geq(gpow(w8, e), t8)) return gpow(g, e);
+    }
+}
+static int64_t invmod(int64_t a, int64_t m) {  // a^-1 mod m, gcd(a, m) = 1
+    int64_t g = m, x = 0, x1 = 1, b = a % m;
+    if (b < 0) b += m;
+    while (b) { int64_t qq = g / b, t = g - qq * b; g = b; b = t; t = x - qq * x1; x = x1; x1 = t; }
+    return ((x % m) + m) % m;
+}
+
 static uint32_t ilog2(uint64_t v) { uint32_t l = 0; while ((1ull << l) < v) ++l; return l; }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: dfprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
+        std::printf("usage: hyprp n [c=25] [-L log2L] [-iters k] [-prof] [-maxbits b] [-B gec_block] [-nogec] [-fresh] [-report k] [-dev i]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -74,7 +115,7 @@ int main(int argc, char** argv) {
     int logL = 0;
     long long iters_limit = 0;
     bool prof = false;
-    double maxbits = 12.8;
+    double maxbits = 17.0;
     int devIdx = 0;
     long long report = 100000;
     int GB = 1000;  // Gerbicz block size (check every GB^2 iterations)
@@ -94,38 +135,45 @@ int main(int argc, char** argv) {
         else if (a == "-fresh") resume = false;
         else { std::fprintf(stderr, "bad arg %s\n", a.c_str()); return 1; }
     }
-    // candidate lengths L = m * 2^k, m in {1, 3, 5}; -L k forces 2^k, or m*2^k with DFPRP_LM=m
+    // candidate lengths L = m * 2^k, m in {1, 3, 5, 9}; -L k forces 2^k, or m*2^k with HYPRP_LM=m
     uint64_t L = 0;
     {
-        const char* lm = std::getenv("DFPRP_LM");
+        const char* lm = std::getenv("HYPRP_LM");
         if (logL) L = (uint64_t)(lm ? std::atoi(lm) : 1) << logL;
         else {
             for (uint64_t cand = 64;; ++cand) {
                 uint64_t v = cand;
                 while (v % 2 == 0) v /= 2;
-                if (v != 1 && v != 3 && v != 5) continue;
+                if (v != 1) continue;  // M31 has only 2-power roots here
                 if ((cand & (cand - 1)) && cand % 2048) continue;  // need W=512 | L/2 and an even H
                 if ((double)n / (double)cand <= maxbits) { L = cand; break; }
             }
         }
     }
     const uint64_t NC = L / 2;
-    uint32_t W = std::getenv("DFPRP_W") ? (uint32_t)std::atoi(std::getenv("DFPRP_W")) : 512;
+    uint32_t W = std::getenv("HYPRP_W") ? (uint32_t)std::atoi(std::getenv("HYPRP_W")) : 512;
+    if (NC % W != 0 || NC / W < 2) W = 512;  // requested width does not fit this length: use the default
     while (W > 2 && (NC % W != 0 || NC / W < 2)) W >>= 1;
     const uint32_t H = (uint32_t)(NC / W);
-    uint32_t TGc = std::getenv("DFPRP_TG") ? (uint32_t)std::atoi(std::getenv("DFPRP_TG")) : 1;
-    while (TGc > 1 && (2 * TGc * H > 1024 || 2 * TGc > W / 2)) TGc >>= 1;
-    std::printf("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u  [double-float]\n", n, cc,
-                (unsigned long long)L, (double)n / L, W, H);
+    uint32_t TGc = std::getenv("HYPRP_TG") ? (uint32_t)std::atoi(std::getenv("HYPRP_TG")) : 2;
+    while (TGc > 1 && (2 * TGc * H > 2048 || (W / 2) % TGc)) TGc >>= 1;  // tail LDS = 32 * TG * H bytes
+    const uint32_t WGc = std::getenv("HYPRP_WG") ? (uint32_t)std::atoi(std::getenv("HYPRP_WG")) : 128;
+    std::printf("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u TG=%u WG=%u  [FP32+M31]\n", n, cc,
+                (unsigned long long)L, (double)n / L, W, H, TGc, WGc);
     auto stages = [](uint32_t P, const char* tag) {
         std::string out;
         uint32_t ps = 1, rest = P;
         auto add = [&](uint32_t R) { char b[64]; std::snprintf(b, sizeof(b), "%s(%u,%u) ", tag, R, ps); out += b; ps *= R; rest /= R; };
         while (rest % 5 == 0) add(5);
         while (rest % 3 == 0) add(3);
-        while (rest % 8 == 0) add(8);
-        if (rest % 4 == 0) add(4);
-        if (rest % 2 == 0) add(2);
+        uint32_t e = 0;
+        while ((1u << e) < rest) ++e;
+        uint32_t n8 = e / 3, n4 = 0, n2 = 0;
+        if (e % 3 == 2) n4 = 1;
+        else if (e % 3 == 1) { if (n8) { --n8; n4 = 2; } else n2 = 1; }  // prefer 8^k*4*4 over 8^k*2
+        while (n8--) add(8);
+        while (n4--) add(4);
+        while (n2--) add(2);
         if (rest != 1) { std::fprintf(stderr, "unsupported length %u\n", P); std::exit(1); }
         return out;
     };
@@ -169,8 +217,8 @@ int main(int argc, char** argv) {
     std::string exe_dir = argv[0];
     auto pos = exe_dir.find_last_of("\\/");
     exe_dir = pos == std::string::npos ? "" : exe_dir.substr(0, pos + 1);
-    std::ifstream kf(exe_dir + "dfprp.cl");
-    if (!kf) { std::fprintf(stderr, "cannot open dfprp.cl\n"); return 1; }
+    std::ifstream kf(exe_dir + "hyprp.cl");
+    if (!kf) { std::fprintf(stderr, "cannot open hyprp.cl\n"); return 1; }
     std::stringstream ss;
     ss << kf.rdbuf();
     const uint32_t NH = (uint32_t)(L / 512 + 2);
@@ -183,15 +231,19 @@ int main(int argc, char** argv) {
         std::snprintf(b, sizeof(b), "(%af)", (double)lo);
         return std::make_pair(r, std::string(b));
     };
+    uint32_t MUc = 0;
+    for (uint32_t u = 1; u < 31; ++u) if ((L % 31) * u % 31 == 1) MUc = u;
     std::string hdr;
     {
         char b[512];
         std::snprintf(b, sizeof(b),
-                      "#define W %uu\n#define H %uu\n#define NEXP %uu\n#define CC %lldL\n#define TG %uu\n#define NH %uu\n",
-                      W, H, n, cc, TGc, NH);
+                      "#define W %uu\n#define H %uu\n#define NEXP %uu\n#define CC %lldL\n#define TG %uu\n#define NH %uu\n"
+                      "#define WG %u\n#define MU %uu\n#define LOGN %uu\n",
+                      W, H, n, cc, TGc, NH, WGc, MUc, ilog2(NC));
         hdr = b;
-        hdr += "#define WSTAGES " + stages(W, "STW") + "\n";
-        hdr += "#define HSTAGES " + stages(H, "STH") + "\n";
+        const bool nofft = std::getenv("HYPRP_NOFFT") != nullptr;  // timing diagnostic only: results are garbage
+        hdr += "#define WSTAGES " + (nofft ? std::string() : stages(W, "STW")) + "\n";
+        hdr += "#define HSTAGES " + (nofft ? std::string() : stages(H, "STH")) + "\n";
         const double kv[6] = {std::sqrt(0.5), std::cos(2 * PI / 5), std::cos(4 * PI / 5), std::sin(2 * PI / 5),
                               std::sin(4 * PI / 5), std::sqrt(3.0) / 2};
         const char* kn[6] = {"K_SQRT1_2", "K_C1", "K_C2", "K_S1", "K_S2", "K_S3"};
@@ -206,7 +258,7 @@ int main(int argc, char** argv) {
     cl_program prog = clCreateProgramWithSource(ctx, 1, &s, nullptr, &err);
     CHECK(err);
     char opts[1024];
-    const char* extra = std::getenv("DFPRP_OPTS");
+    const char* extra = std::getenv("HYPRP_OPTS");
     std::snprintf(opts, sizeof(opts), "%s", extra ? extra : "");
     if (clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         size_t len;
@@ -222,29 +274,46 @@ int main(int argc, char** argv) {
     cl_kernel kTM = clCreateKernel(prog, "tailMul", &err); CHECK(err);
     cl_kernel kI = clCreateKernel(prog, "invW", &err); CHECK(err);
 
-    // ---- tables (double-float)
-    struct cdf { float a, b, c, d; };
-    auto tocdf = [](cplx v) {
-        float rh = (float)v.x, ih = (float)v.y;
-        return cdf{rh, (float)(v.x - rh), ih, (float)(v.y - ih)};
-    };
-    std::vector<cdf> twW(W), twH(H), twN1(W), twN2(H);
-    for (uint32_t i = 0; i < W; ++i) { twW[i] = tocdf(root(i, W)); twN1[i] = tocdf(root(i, NC)); }
-    for (uint32_t i = 0; i < H; ++i) { twH[i] = tocdf(root(i, H)); twN2[i] = tocdf(root((uint64_t)W * i, NC)); }
+    // ---- tables: twiddles as (FP32 complex, GF(p^2) element); weights as (FP32 factor, GF(p) factor)
+    if (mpow((uint64_t)cc % P31, (P31 - 1) / 2) != 1) {
+        std::fprintf(stderr, "c = %lld is not a square mod 2^31-1: its L-th root does not exist\n", cc);
+        return 1;
+    }
+    const uint32_t KN = ilog2(NC);
+    const G2 gN = m31root(KN);
+    struct hc { float a, b; uint32_t c, d; };
+    auto toh = [](cplx v, G2 m) { return hc{(float)v.x, (float)v.y, (uint32_t)m.re, (uint32_t)m.im}; };
+    std::vector<hc> twW(W), twH(H), twN1(W), twN2(H);
+    for (uint32_t i = 0; i < W; ++i) {
+        twW[i] = toh(root(i, W), gpow(gN, (NC / W) * (uint64_t)i));
+        twN1[i] = toh(root(i, NC), gpow(gN, i));
+    }
+    for (uint32_t i = 0; i < H; ++i) {
+        twH[i] = toh(root(i, H), gpow(gN, (NC / H) * (uint64_t)i));
+        twN2[i] = toh(root((uint64_t)W * i, NC), gpow(gN, (uint64_t)W * i));
+    }
     const uint32_t WSn = 512;
     std::vector<float> WTAB(2 * (2 * NH + 2 * WSn), 0.f);
     std::vector<uint32_t> ITAB(2 * NH + 2 * WSn, 0);
     {
         const double log2c = std::log2((double)cc);
-        auto put = [&](size_t idx, double v) { float hi = (float)v; WTAB[2 * idx] = hi; WTAB[2 * idx + 1] = (float)(v - hi); };
+        const int64_t half = (int64_t)(P31 - 1) / 2;  // odd; the order of c divides it
+        const uint64_t kappa = mpow((uint64_t)cc, (uint64_t)invmod((int64_t)(L % half), half));  // c^(1/L)
+        if (mpow(kappa, L) != (uint64_t)cc % P31) { std::fprintf(stderr, "c^(1/L) failed\n"); return 1; }
+        const uint64_t ikappa = mpow(kappa, P31 - 2);
+        auto put = [&](size_t idx, double v, uint64_t m) {
+            WTAB[2 * idx] = (float)v;
+            uint32_t mb = (uint32_t)m;
+            std::memcpy(&WTAB[2 * idx + 1], &mb, 4);
+        };
         for (uint32_t jh = 0; jh < NH; ++jh) {
             uint64_t x = (uint64_t)n * jh * WSn;
             uint64_t r = x % L, f = x / L;
             ITAB[jh] = (uint32_t)r;
             ITAB[NH + WSn + jh] = (uint32_t)f;
             double wv = std::exp2(-(double)r / (double)L + (double)jh * WSn * log2c / (double)L);
-            put(jh, wv);
-            put(NH + WSn + jh, 1.0 / (wv * (double)NC));
+            put(jh, wv, mpow(kappa, (uint64_t)jh * WSn));
+            put(NH + WSn + jh, 1.0 / (wv * (double)NC), mpow(ikappa, (uint64_t)jh * WSn));
         }
         for (uint32_t jl = 0; jl < WSn; ++jl) {
             uint64_t x = (uint64_t)n * jl;
@@ -252,8 +321,8 @@ int main(int argc, char** argv) {
             ITAB[NH + jl] = (uint32_t)r;
             ITAB[2 * NH + WSn + jl] = (uint32_t)f;
             double wv = std::exp2(-(double)r / (double)L + (double)jl * log2c / (double)L);
-            put(NH + jl, wv);
-            put(2 * NH + WSn + jl, 1.0 / wv);
+            put(NH + jl, wv, mpow(kappa, jl));
+            put(2 * NH + WSn + jl, 1.0 / wv, mpow(ikappa, jl));
         }
     }
 
@@ -310,7 +379,7 @@ int main(int argc, char** argv) {
     clSetKernelArg(kI, 9, sizeof(cl_mem), &bIT);
     clSetKernelArg(kF, 7, sizeof(cl_mem), &bIT);
 
-    const size_t WGS = 64;
+    const size_t WGS = WGc;
     const size_t gF = (size_t)H * WGS, gT = (size_t)(W / (2 * TGc)) * WGS, gI = (size_t)H * WGS;
     cl_mem curF = nullptr, curFout = nullptr, curI = nullptr;
     int curMul = -1;
@@ -474,7 +543,10 @@ int main(int argc, char** argv) {
                     done, todo, msit, e2 / 4294967295.0, msit * (todo - done) / 60000.0, el);
         std::fflush(stdout);
         tl = now; itl = done;
-        if (e2 / 4294967295.0 > 0.42) { std::fprintf(stderr, "round-off too large\n"); std::exit(3); }
+        if (e2 / 4294967295.0 > 0.42 && !std::getenv("HYPRP_NOFFT")) {
+            std::fprintf(stderr, "round-off too large\n");
+            std::exit(3);
+        }
     };
     auto printRes = [&](const std::vector<uint32_t>& limb, bool full) {
         bool isone = limb[0] == 1;
@@ -518,7 +590,7 @@ int main(int argc, char** argv) {
     // so with d_s = prod_{u<=s} y_u (one y every B iterations): d_s == y_0 * d_(s-1)^(2^B).
     const long long G = (long long)n - 41;
     char ckname[128];
-    std::snprintf(ckname, sizeof(ckname), "dfprp_%u_%lld.ckpt", n, cc);
+    std::snprintf(ckname, sizeof(ckname), "hyprp_%u_%lld.ckpt", n, cc);
     long long it = 0;
     auto saveCk = [&](long long iter) {
         CHECK(clEnqueueReadBuffer(q, X.D, CL_TRUE, 0, 8 * NC, Dh.data(), 0, nullptr, nullptr));

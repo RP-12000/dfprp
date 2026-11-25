@@ -1,116 +1,85 @@
-// dfprp: weighted real FFT mod 2^n - c (four-step W x H, three kernels), where every
-// floating-point value is a "double-float": an unevaluated sum hi + lo of two FP32 numbers (~48-bit mantissa).
-// Complex values are float4 (re.hi, re.lo, im.hi, im.lo). L = 2*W*H need not be a power of two (H may carry a
-// factor 3 or 5). Compile-time constants: W, H, LOGW, NEXP, CC, TG, NH (weight table rows), WSTAGES, HSTAGES,
-// and the double-float constants K_* (hex float pairs).
+// hyprp: weighted real FFT mod 2^n - c (four-step W x H, three kernels, same structure as dfprp), computed twice
+// at once: once in FP32 (approximate) and once exactly in GF(p^2), p = M31 = 2^31 - 1 (a "complex" NTT; i^2 = -1).
+// Every complex value is a float4: .xy = FP32 complex, .zw = the GF(p^2) element (bit pattern of two uints).
+// The exact result z_j of the convolution is rebuilt as z = r + p * round((z_fp32 - r) / p) with r = z mod p
+// from the NTT, so the FP32 part only has to be accurate to +-p/2 and words can be ~16-18 bits wide.
+// GF(p) facts used: 2^31 == 1, so multiplying by a power of two is a 31-bit rotation; 1/2 = 2^30, 1/sqrt2 = 2^15;
+// 2 and c = 25 have odd order, so the DWT weights 2^(k/L) and c^(j/L) exist in GF(p).
+// Compile-time constants: W, H, NEXP, CC, TG, NH, WG, WSTAGES, HSTAGES, MU (= L^-1 mod 31), LOGN (= log2 N).
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
-#pragma OPENCL FP_CONTRACT OFF  // error-free transforms must not be fused
 
-typedef float2 df;
+typedef float2 df;     // weight table entry: (FP32 weight, bits of the GF(p) weight factor)
 typedef float4 C;
 #define NC (W * H)
 #define LL (2 * NC)
+#ifndef WG
 #define WG 64
-#define WS 512u  // weight table split: j = jh * WS + jl
-
-#define MKC(r, i) ((C)((r), (i)))
-
-inline df fts(float a, float b) { float s = a + b; return (df)(s, b - (s - a)); }
-inline df ts(float a, float b) {
-    float s = a + b;
-    float bb = s - a;
-    return (df)(s, (a - (s - bb)) + (b - bb));
-}
-#ifdef ACCURATE_ADD
-inline df dadd(df a, df b) {
-    df s = ts(a.x, b.x), t = ts(a.y, b.y);
-    s.y += t.x;
-    s = fts(s.x, s.y);
-    s.y += t.y;
-    return fts(s.x, s.y);
-}
-inline df dsub(df a, df b) { return dadd(a, (df)(-b.x, -b.y)); }
-#else
-inline df dadd(df a, df b) { df s = ts(a.x, b.x); return fts(s.x, s.y + (a.y + b.y)); }
-inline df dsub(df a, df b) { df s = ts(a.x, -b.x); return fts(s.x, s.y + (a.y - b.y)); }
 #endif
-inline df dneg(df a) { return (df)(-a.x, -a.y); }
-inline df dmul(df a, df b) {
-    float p = a.x * b.x;
-    float e = fma(a.x, b.x, -p);
-    e = fma(a.x, b.y, fma(a.y, b.x, e));
-    return fts(p, e);
-}
-inline df dmulf(df a, float b) {
-    float p = a.x * b;
-    float e = fma(a.x, b, -p);
-    e = fma(a.y, b, e);
-    return fts(p, e);
-}
-// a*b - c*d with a single renormalisation
-inline df dmms(df a, df b, df c, df d) {
-    float p1 = a.x * b.x, e1 = fma(a.x, b.x, -p1);
-    float p2 = c.x * d.x, e2 = fma(c.x, d.x, -p2);
-    df s = ts(p1, -p2);
-    float lo = s.y + (e1 - e2);
-    lo = fma(a.x, b.y, lo);
-    lo = fma(a.y, b.x, lo);
-    lo = fma(-c.x, d.y, lo);
-    lo = fma(-c.y, d.x, lo);
-    return fts(s.x, lo);
-}
-inline df dmma(df a, df b, df c, df d) { return dmms(a, b, dneg(c), d); }
+#define WS 512u  // weight table split: j = jh * WS + jl
+#define MP 0x7FFFFFFFu
+#define SQRT1_2F 0.70710678118654752440f
 
-inline C cadd(C a, C b) { return MKC(dadd(a.xy, b.xy), dadd(a.zw, b.zw)); }
-inline C csub(C a, C b) { return MKC(dsub(a.xy, b.xy), dsub(a.zw, b.zw)); }
-inline C cmul(C a, C b) { return MKC(dmms(a.xy, b.xy, a.zw, b.zw), dmma(a.xy, b.zw, a.zw, b.xy)); }
-inline C csq(C a) { df t = dmul(a.xy, a.zw); return MKC(dmms(a.xy, a.xy, a.zw, a.zw), t * 2.0f); }
-inline C cmulr(C a, df s) { return MKC(dmul(a.xy, s), dmul(a.zw, s)); }
-inline C conjg(C a) { return (C)(a.x, a.y, -a.z, -a.w); }
+// ---- GF(p) arithmetic on values in [0, p] (p itself also stands for 0)
+inline uint mred(uint x) { return (x & MP) + (x >> 31); }
+inline uint madd(uint a, uint b) { return mred(a + b); }
+inline uint msub(uint a, uint b) { return mred(a + (MP - b)); }
+inline uint mneg(uint a) { return MP - a; }
+inline uint mmul(uint a, uint b) {
+    ulong t = (ulong)a * b;
+    return mred((uint)(t & MP) + (uint)(t >> 31));
+}
+inline uint mrot(uint x, uint s) { return s ? (((x << s) & MP) | (x >> (31 - s))) : x; }  // x * 2^s, s < 31
+inline uint mhalf(uint x) { return (x >> 1) | ((x & 1u) << 30); }                     // x / 2
+
+// ---- hybrid complex values
+inline uint2 MPART(C a) { return as_uint2(a.zw); }
+inline C MKH(float2 f, uint2 m) { return (C)(f, as_float2(m)); }
+inline C cadd(C a, C b) {
+    uint2 x = MPART(a), y = MPART(b);
+    return MKH(a.xy + b.xy, (uint2)(madd(x.x, y.x), madd(x.y, y.y)));
+}
+inline C csub(C a, C b) {
+    uint2 x = MPART(a), y = MPART(b);
+    return MKH(a.xy - b.xy, (uint2)(msub(x.x, y.x), msub(x.y, y.y)));
+}
+inline C cmul(C a, C b) {
+    uint2 x = MPART(a), y = MPART(b);
+    float2 f = (float2)(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x));
+    uint2 m = (uint2)(msub(mmul(x.x, y.x), mmul(x.y, y.y)), madd(mmul(x.x, y.y), mmul(x.y, y.x)));
+    return MKH(f, m);
+}
+inline C conjg(C a) { uint2 m = MPART(a); return MKH((float2)(a.x, -a.y), (uint2)(m.x, mneg(m.y))); }
 // multiply by -i (forward) or +i (inverse)
-inline C mulmi(C a, int dir) { return dir > 0 ? (C)(a.z, a.w, -a.x, -a.y) : (C)(-a.z, -a.w, a.x, a.y); }
-inline C muli(C a) { return (C)(-a.z, -a.w, a.x, a.y); }
-
-#define KDF(name) ((df)(name##_HI, name##_LO))
+inline C mulmi(C a, int dir) {
+    uint2 m = MPART(a);
+    return dir > 0 ? MKH((float2)(a.y, -a.x), (uint2)(m.y, mneg(m.x))) : MKH((float2)(-a.y, a.x), (uint2)(mneg(m.y), m.x));
+}
+inline C muli(C a) { uint2 m = MPART(a); return MKH((float2)(-a.y, a.x), (uint2)(mneg(m.y), m.x)); }
+inline C chalf(C a) { uint2 m = MPART(a); return MKH(a.xy * 0.5f, (uint2)(mhalf(m.x), mhalf(m.y))); }
+inline C csqrthalf(C a) { uint2 m = MPART(a); return MKH(a.xy * SQRT1_2F, (uint2)(mrot(m.x, 15), mrot(m.y, 15))); }
+#define cadd_r cadd
+#define csub_r csub
+inline C cnorm(C a) { return a; }
 
 inline void dft2(C* x) { C t = x[0]; x[0] = cadd(t, x[1]); x[1] = csub(t, x[1]); }
 inline void dft4(C* x, int dir) {
     C v0 = cadd(x[0], x[2]), v1 = csub(x[0], x[2]), v2 = cadd(x[1], x[3]), v3 = mulmi(csub(x[1], x[3]), dir);
     x[0] = cadd(v0, v2); x[2] = csub(v0, v2); x[1] = cadd(v1, v3); x[3] = csub(v1, v3);
 }
+// the GF(p^2) twiddle tables are built so that w_P^(P/4) = -i and w_P^(P/8) = (1 - i)/sqrt2, as in C
 inline void dft8(C* x, int dir) {
     C e[4] = {x[0], x[2], x[4], x[6]}, o[4] = {x[1], x[3], x[5], x[7]};
     dft4(e, dir); dft4(o, dir);
-    const df h = KDF(K_SQRT1_2);
-    // o1 *= (1 -/+ i)/sqrt2, o3 *= (-1 -/+ i)/sqrt2, o2 *= -/+ i
     C a = o[1], b = o[3];
-    C ma = mulmi(a, dir), mb = mulmi(b, dir);
-    o[1] = cmulr(cadd(a, ma), h);
-    o[3] = cmulr(csub(mb, b), h);
+    o[1] = csqrthalf(cadd(a, mulmi(a, dir)));
+    o[3] = csqrthalf(csub(mulmi(b, dir), b));
     o[2] = mulmi(o[2], dir);
     for (int q = 0; q < 4; ++q) { x[q] = cadd(e[q], o[q]); x[q + 4] = csub(e[q], o[q]); }
 }
-inline void dft3(C* x, int dir) {
-    C s = cadd(x[1], x[2]);
-    C d = mulmi(cmulr(csub(x[1], x[2]), KDF(K_S3)), dir);  // -/+ i * (sqrt3/2)(x1 - x2)
-    C t = csub(x[0], s * 0.5f);
-    x[0] = cadd(x[0], s);
-    x[1] = cadd(t, d);
-    x[2] = csub(t, d);
-}
-inline void dft5(C* x, int dir) {
-    C t1 = cadd(x[1], x[4]), t2 = cadd(x[2], x[3]), t3 = csub(x[1], x[4]), t4 = csub(x[2], x[3]);
-    const df c1 = KDF(K_C1), c2 = KDF(K_C2), s1 = KDF(K_S1), s2 = KDF(K_S2);
-    C a1 = cadd(x[0], cadd(cmulr(t1, c1), cmulr(t2, c2)));
-    C a2 = cadd(x[0], cadd(cmulr(t1, c2), cmulr(t2, c1)));
-    C b1 = mulmi(cadd(cmulr(t3, s1), cmulr(t4, s2)), dir);
-    C b2 = mulmi(csub(cmulr(t3, s2), cmulr(t4, s1)), dir);
-    x[0] = cadd(x[0], cadd(t1, t2));
-    x[1] = cadd(a1, b1);
-    x[4] = csub(a1, b1);
-    x[2] = cadd(a2, b2);
-    x[3] = csub(a2, b2);
-}
+// lengths with factors 3 or 5 are not supported by hyprp (no 5th roots of unity in GF(p^2)); stubs keep the
+// shared stage macro compiling
+inline void dft3(C* x, int dir) {}
+inline void dft5(C* x, int dir) {}
 
 // One Stockham stage, in place in local memory a (NB arrays of length P), radix R, sub-length PS.
 // tw[j] = exp(-2 pi i j / P).
@@ -157,17 +126,31 @@ inline void dft5(C* x, int dir) {
 #define FFTH_RUN(a, tw, dir) { __local C* a_ = (a); __global const C* tw_ = (tw); const int dir_ = (dir); HSTAGES }
 
 // ---- digit positions and weights.  B(j) = ceil(n j / L) = FH + FL + ceil((RH + RL) / L)
-// itab = [RH(NH) | RL(WS) | FH(NH) | FL(WS)], wtab = [WH(NH) | WL(WS) | iWH(NH) | iWL(WS)] (df)
-inline uint Bpos(__global const uint* it, uint j, uint* ce) {
+// itab = [RH(NH) | RL(WS) | FH(NH) | FL(WS)]
+// wtab = [WH(NH) | WL(WS) | iWH(NH) | iWL(WS)], each entry (FP32 factor, bits of the GF(p) factor c^(.../L))
+inline uint Bpos2(__global const uint* it, uint j, uint* ce, uint* rs) {
     const uint jh = j / WS, jl = j % WS;
-    const uint rs = it[jh] + it[NH + jl];
-    *ce = rs == 0 ? 0u : (rs <= LL ? 1u : 2u);
+    *rs = it[jh] + it[NH + jl];
+    *ce = *rs == 0 ? 0u : (*rs <= LL ? 1u : 2u);
     return it[NH + WS + jh] + it[2 * NH + WS + jl] + *ce;
 }
-inline df dldexp(df a, int e) { return (df)(ldexp(a.x, e), ldexp(a.y, e)); }
-inline df wgt(__global const df* wt, uint j, uint ce) { return dldexp(dmul(wt[j / WS], wt[NH + j % WS]), (int)ce); }
-inline df iwgt(__global const df* wt, uint j, uint ce) {
-    return dldexp(dmul(wt[NH + WS + j / WS], wt[2 * NH + WS + j % WS]), -(int)ce);
+inline uint Bpos(__global const uint* it, uint j, uint* ce) { uint rs; return Bpos2(it, j, ce, &rs); }
+// GF(p) weight 2^((ce L - rs)/L) = 2^(MU (ce L - rs) mod 31): a rotation
+inline uint wrot(uint ce, uint rs) {
+    long v = ((long)ce * LL - (long)rs) % 31;
+    if (v < 0) v += 31;
+    return (uint)((v * MU) % 31);
+}
+inline float wgtF(__global const df* wt, uint j, uint ce) { return ldexp(wt[j / WS].x * wt[NH + j % WS].x, (int)ce); }
+inline float iwgtF(__global const df* wt, uint j, uint ce) {
+    return ldexp(wt[NH + WS + j / WS].x * wt[2 * NH + WS + j % WS].x, -(int)ce);
+}
+inline uint wgtM(__global const df* wt, uint j, uint ce, uint rs) {
+    return mrot(mmul(as_uint(wt[j / WS].y), as_uint(wt[NH + j % WS].y)), wrot(ce, rs));
+}
+inline uint iwgtM(__global const df* wt, uint j, uint ce, uint rs) {  // includes 1/N = 2^-LOGN
+    return mrot(mmul(as_uint(wt[NH + WS + j / WS].y), as_uint(wt[2 * NH + WS + j % WS].y)),
+                (62 - wrot(ce, rs) - (LOGN % 31)) % 31);
 }
 
 inline long bal(long v, uint b, long* carry) {
@@ -176,6 +159,7 @@ inline long bal(long v, uint b, long* carry) {
     *carry = (v - d) >> b;
     return d;
 }
+inline uint tomod(long d) { return d < 0 ? (uint)(d + MP) : (uint)d; }  // |d| < p
 
 // twN1[i] = w_N^i for i < W ; twN2[i] = w_N^(W i) = w_H^i for i < H
 inline C twN(__global const C* twN1, __global const C* twN2, uint e) { return cmul(twN1[e % W], twN2[e / W]); }
@@ -194,12 +178,14 @@ void fwdW(__global const int2* D, __global const int2* CY, __global const df* WT
         const int2 cA = CY[(m1 % H) * W + m1 / H], cB = CY[(m2 % H) * W + m2 / H];
         const long cin = (long)cA.x * (m == 0 ? CC : 1) + (long)cB.y * (m < 2 ? CC : 1);
         int2 d = D[pos];
-        uint ce0, ce1;
-        uint B0 = Bpos(IT, 2 * m, &ce0), B1 = Bpos(IT, 2 * m + 1, &ce1);
+        uint ce0, ce1, rs0, rs1;
+        uint B0 = Bpos2(IT, 2 * m, &ce0, &rs0), B1 = Bpos2(IT, 2 * m + 1, &ce1, &rs1);
         long c0;
         long d0 = bal((long)d.x + cin, B1 - B0, &c0);
         long d1 = (long)d.y + c0;
-        s1[w] = MKC(dmulf(wgt(WT, 2 * m, ce0), (float)d0), dmulf(wgt(WT, 2 * m + 1, ce1), (float)d1));
+        float2 f = (float2)((float)d0 * wgtF(WT, 2 * m, ce0), (float)d1 * wgtF(WT, 2 * m + 1, ce1));
+        uint2 mm = (uint2)(mmul(tomod(d0), wgtM(WT, 2 * m, ce0, rs0)), mmul(tomod(d1), wgtM(WT, 2 * m + 1, ce1, rs1)));
+        s1[w] = MKH(f, mm);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 #define NB_ 1
@@ -211,21 +197,19 @@ void fwdW(__global const int2* D, __global const int2* CY, __global const df* WT
 // square step for a pair (k, N-k): Vk, Vn in/out. t2 = w_N^k.
 inline void sqpair(C* Vk, C* Vn, C t2) {
     C a = *Vk, b = conjg(*Vn);
-    C E = cadd(a, b) * 0.5f;
-    C dd = csub(a, b) * 0.5f;
-    C O = (C)(dd.z, dd.w, -dd.x, -dd.y);
-    C P = cadd(csq(E), cmul(t2, csq(O)));
-    C Q = cmul(E, O) * 2.0f;
+    C E = chalf(cadd(a, b));
+    C O = mulmi(chalf(csub(a, b)), 1);  // (a - b) / (2i)
+    C P = cadd(cmul(E, E), cmul(t2, cmul(O, O)));
+    C Q = cmul(E, O);
+    Q = cadd(Q, Q);
     *Vk = cadd(P, muli(Q));
     *Vn = cadd(conjg(P), muli(conjg(Q)));
 }
 inline void mulpair(C* Vk, C* Vn, C Uk, C Un, C t2) {
     C a = *Vk, b = conjg(*Vn);
-    C Ex = cadd(a, b) * 0.5f, dx = csub(a, b) * 0.5f;
-    C Ox = (C)(dx.z, dx.w, -dx.x, -dx.y);
+    C Ex = chalf(cadd(a, b)), Ox = mulmi(chalf(csub(a, b)), 1);
     C c = Uk, d = conjg(Un);
-    C Ey = cadd(c, d) * 0.5f, dy = csub(c, d) * 0.5f;
-    C Oy = (C)(dy.z, dy.w, -dy.x, -dy.y);
+    C Ey = chalf(cadd(c, d)), Oy = mulmi(chalf(csub(c, d)), 1);
     C E = cadd(cmul(Ex, Ey), cmul(t2, cmul(Ox, Oy)));
     C O = cadd(cmul(Ex, Oy), cmul(Ox, Ey));
     *Vk = cadd(E, muli(O));
@@ -307,13 +291,14 @@ void tailMul(__global C* A, __global const C* twH, __global const C* twN1, __glo
     tailImpl(s1, A, Bf, twH, twN1, twN2, 2);
 }
 
-// round a double-float to the nearest integer; returns |fractional distance|
-inline long dround(df x, float* err) {
-    float rh = rint(x.x);
-    float f = (x.x - rh) + x.y;
-    float rf = rint(f);
-    *err = fabs(f - rf);
-    return (long)rh + (long)rf;
+// exact value z from the FP32 approximation zf and the residue r = z mod p; err = distance of (zf - r)/p from an
+// integer (must stay well below 0.5)
+inline long hround(float zf, uint r, float* err) {
+    if (r == MP) r = 0;
+    const float q = (zf - (float)r) * (1.0f / (float)MP);
+    const float tq = rint(q);
+    *err = fabs(q - tq);
+    return (long)r + (long)tq * (long)MP;
 }
 
 __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
@@ -333,13 +318,14 @@ void invW(__global const C* A, __global int2* D, __global int2* CY, __global con
     for (uint w = t; w < W; w += WG) {
         const uint pos = h * W + w;
         const uint m = h + H * w;
-        uint ce0, ce1, ce2, ce4;
-        uint B0 = Bpos(IT, 2 * m, &ce0), B1 = Bpos(IT, 2 * m + 1, &ce1), B2 = Bpos(IT, 2 * m + 2, &ce2);
+        uint ce0, ce1, ce2, ce4, rs0, rs1;
+        uint B0 = Bpos2(IT, 2 * m, &ce0, &rs0), B1 = Bpos2(IT, 2 * m + 1, &ce1, &rs1), B2 = Bpos(IT, 2 * m + 2, &ce2);
         uint B4 = Bpos(IT, 2 * m + 4, &ce4);
         C v = s1[w];
+        uint2 vm = MPART(v);
         float e0, e1;
-        long r0 = dround(dmul(v.xy, iwgt(IWT, 2 * m, ce0)), &e0);
-        long r1 = dround(dmul(v.zw, iwgt(IWT, 2 * m + 1, ce1)), &e1);
+        long r0 = hround(v.x * iwgtF(IWT, 2 * m, ce0), mmul(vm.x, iwgtM(IWT, 2 * m, ce0, rs0)), &e0);
+        long r1 = hround(v.y * iwgtF(IWT, 2 * m + 1, ce1), mmul(vm.y, iwgtM(IWT, 2 * m + 1, ce1, rs1)), &e1);
         emax = fmax(emax, fmax(e0, e1));
         long c0, c1;
         long d0 = bal(r0 * mulc, B1 - B0, &c0);
