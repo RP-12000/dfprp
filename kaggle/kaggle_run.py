@@ -110,11 +110,11 @@ def gpu_count():
 
 def stamp(level='INFO', dev=None, when=None):
     """'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ', the line prefix of dfprp's and Mass Prime Siever's logs; a GPU's lines
-    start '[GPU d YYYY-MM-DD HH:MM:SS] ' instead (UTC; 'WARN: ' after it for a warning)"""
+    start '[GPU d YYYY-MM-DD HH:MM:SS] ' instead (UTC); a GPU's warning starts '[WARN YYYY-MM-DD HH:MM:SS] GPU d: '"""
     when = when or time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
     if dev is None:
         return f'{when} UTC+0 [{level}] '
-    return f'[GPU {dev} {when}] ' + ('' if level == 'INFO' else level + ': ')
+    return f'[GPU {dev} {when}] ' if level == 'INFO' else f'[{level} {when}] GPU {dev}: '
 
 
 def hms(seconds):
