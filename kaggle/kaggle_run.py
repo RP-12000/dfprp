@@ -23,9 +23,10 @@ KNOWN = {  # Prime95 30.19 PRP-3 residue-type 1 results for 2^n - 25 (from the p
 # 16 bits/word (32-bit digits) and at 512K words
 CROSS = {4200013: '7490970688C5F822', 4500013: '386AEF1A83E0FA7C', 4574401: '15011123C7996836',
          9000013: '6B4A2A630EE28A6F'}
-PROGRESS_EVERY = 60   # seconds between progress lines
+REPORT = 10000        # dfprp prints a progress line every REPORT iterations (the Gerbicz check is every 1,000,000)
 RUNNING = []          # live dfprp processes, killed on Ctrl+C
-LIVE = {}             # GPU -> (n, log path) of the test it is running, for the progress line
+LIVE = {}             # GPU -> (n, log path) of the test it is running, for the progress lines
+SEEN = {}             # log path -> bytes of it already shown as progress lines
 PRECISION = []        # ['--fp64'] or ['--fp32'] to force dfprp's arithmetic (default: dfprp decides)
 STOP = threading.Event()
 lock = threading.Lock()
@@ -107,6 +108,26 @@ def gpu_count():
         return 1
 
 
+def stamp(level='INFO', dev=None, when=None):
+    """'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ', the line prefix of dfprp's and Mass Prime Siever's logs; a GPU's lines
+    start '[GPU d YYYY-MM-DD HH:MM:SS] ' instead (UTC; 'WARN: ' after it for a warning)"""
+    when = when or time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    if dev is None:
+        return f'{when} UTC+0 [{level}] '
+    return f'[GPU {dev} {when}] ' + ('' if level == 'INFO' else level + ': ')
+
+
+def hms(seconds):
+    """hh:mm:ss, with 'Nd ' in front from 24 hours on"""
+    s = max(0, int(round(seconds)))
+    d, s = divmod(s, 86400)
+    return (f'{d}d ' if d else '') + f'{s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}'
+
+
+def say(text, level='INFO', dev=None):
+    print(stamp(level, dev) + text, flush=True)
+
+
 def msg(line):
     """a dfprp output line without its 'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ' time stamp"""
     m = re.match(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\+0 \[\w+\] ', line)
@@ -122,27 +143,44 @@ def parse(log):
             verdict.group(1) if verdict else None, float(ms.group(1)) if ms else None)
 
 
-def last_progress(n, path):
-    """a short progress note for one running test, e.g. 'n=4109583 61% ETA 3.5 min'"""
-    try:
-        lines = [msg(l) for l in open(path).read().splitlines() if ' iter ' in l or 'resumed' in l]
-    except OSError:
-        lines = []
-    m = re.search(r'iter (\d+)/(\d+) .*ETA ([0-9.]+) min', lines[-1]) if lines else None
-    if m:
-        return f'n={n} {100 * int(m.group(1)) // max(1, int(m.group(2)))}% ETA {m.group(3)} min'
-    r = re.search(r'at iteration (\d+)', lines[-1]) if lines else None
-    return f'n={n} resumed at {r.group(1)}' if r else f'n={n} starting'
+def short(dev, n, line):
+    """a dfprp log line as a short progress note (None for the lines not shown), e.g.
+    '[GPU 0 2026-11-27 02:20:42] Iteration 2500000/4109583 [60.83%], ms/iter: 0.1313, ETA: 00:03:31'"""
+    m = msg(line)
+    lv = re.match(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC\+0 \[(\w+)\] ', line)
+    t = stamp(lv.group(2), dev, lv.group(1)) if lv else stamp('INFO', dev)
+    p = re.search(r'iter (\d+)/(\d+) +([0-9.]+) ms/iter', m)
+    if p:
+        a, todo, ms = int(p.group(1)), int(p.group(2)), float(p.group(3))
+        return (f'{t}Iteration {a}/{n} [{100 * a / n:.2f}%], ms/iter: {ms:.4f}, '
+                f'ETA: {hms(ms * (todo - a) / 1000)}')
+    if m.startswith(('Gerbicz', 'resumed', 'round-off', 'using the checkpoint')):
+        return f'{t}n={n} {m}'
+    return None
 
 
-def progress_line():
-    """a line per GPU, printed every PROGRESS_EVERY seconds while tests run; all GPUs' lines go out in one write, so
-    Kaggle's log shows them together without a blank line between them"""
+def show_progress():
+    """prints the new progress lines of every running test: dfprp writes one every REPORT iterations and runs a
+    Gerbicz error check every 1,000,000. All new lines go out in one write, so Kaggle's log has no blank lines
+    between them."""
     with lock:
         live = sorted(LIVE.items())
-    if live:
-        now = time.strftime('%H:%M UTC', time.gmtime())
-        print('\n'.join(f'{now}  GPU {dev}: {last_progress(n, path)}' for dev, (n, path) in live), flush=True)
+    out = []
+    for dev, (n, path) in live:
+        try:
+            with open(path, 'rb') as f:
+                f.seek(SEEN.get(path, 0))
+                data = f.read()
+        except OSError:
+            continue
+        cut = data.rfind(b'\n') + 1  # whole lines only; the rest is read next time
+        SEEN[path] = SEEN.get(path, 0) + cut
+        for line in data[:cut].decode('utf-8', 'replace').splitlines():
+            s = short(dev, n, line)
+            if s:
+                out.append(s)
+    if out:
+        print('\n'.join(out), flush=True)
 
 
 def run_one(dev, n, c, args, cwd, logname, deadline):
@@ -155,6 +193,7 @@ def run_one(dev, n, c, args, cwd, logname, deadline):
         RUNNING.append(p)
         with lock:
             LIVE[dev] = (n, path)
+            SEEN[path] = 0
         try:
             while p.poll() is None:
                 if STOP.is_set() or (deadline and time.time() > deadline):
@@ -240,7 +279,7 @@ def restore():
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not os.path.exists(dst):
             shutil.copy(f, dst)
-    print(f'restored {len(done)} results and {len(glob.glob(WORK + "/ckpt/*.ckpt"))} checkpoints')
+    say(f'restored {len(done)} results and {len(glob.glob(WORK + "/ckpt/*.ckpt"))} checkpoints')
     return done
 
 
@@ -253,15 +292,14 @@ def worker(dev, queue, c, deadline, done):
             n = queue.pop(0)
         if (n, -c) in done:
             continue
-        log, secs = run_one(dev, n, c, ['-report', '250000'], ck, f'{PROG}_{n}.log', deadline)
+        log, secs = run_one(dev, n, c, ['-report', str(REPORT)], ck, f'{PROG}_{n}.log', deadline)
         if log is None:
             why = 'stopped' if STOP.is_set() else 'time limit'
-            print(f'[GPU {dev}] {why}: n={n} interrupted, its checkpoint (saved every 1M iterations) is kept',
-                  flush=True)
+            say(f'{why}: n={n} interrupted, its checkpoint (saved every 1M iterations) is kept', dev=dev)
             return
         res64, res2048, verdict, ms = parse(log)
         if not res64 or not verdict:
-            print(f'[GPU {dev}] n={n} failed:\n' + log[-2000:], flush=True)
+            say(f'n={n} failed:\n' + log[-2000:], 'WARN', dev)
             continue
         be = re.search(r'\| (CUDA|OpenCL)', log)
         uu = re.search(r'\| uuid (GPU-[0-9a-f-]+)', log)  # the physical card: the "computer" of a Kaggle/Colab result
@@ -285,15 +323,15 @@ def worker(dev, queue, c, deadline, done):
             with open(f'{WORK}/results.json.txt', 'a') as out:
                 out.write(json.dumps(d) + '\n')
         flag = '' if not known else ('  MATCHES Prime95' if known == res64 else f'  DIFFERS from Prime95 {known}')
-        print(f'[GPU {dev}] n={n} {"PRP!" if d["status"] == "P" else "composite"} RES64 {res64} '
-              f'{secs / 60:.1f} min{flag}', flush=True)
+        say(f'n={n} {"PRP!" if d["status"] == "P" else "composite"} RES64 {res64} '
+            f'{secs / 60:.1f} min{flag}', dev=dev)
 
 
 def main(mode, exponents, c, hours):
     t_start = time.time()
     # processes left over from an interrupted run would fight over the GPU and the checkpoint files
     if subprocess.run(['pkill', '-f', BUILD + '/'], capture_output=True).returncode == 0:
-        print('stopped dfprp processes left over from an earlier run (they resume from their checkpoints)')
+        say('stopped dfprp processes left over from an earlier run (they resume from their checkpoints)')
         time.sleep(2)
     build()
     if mode == 'selftest':
@@ -309,28 +347,26 @@ def main(mode, exponents, c, hours):
     queue = [n for n in exponents if (n, -c) not in done]
     ngpu = gpu_count()
     deadline = t_start + hours * 3600
-    print(f'{len(queue)} exponents to test on {ngpu} GPU(s); stopping at {hours} h')
-    print(f'progress every {PROGRESS_EVERY} s; full logs in {WORK}/ckpt/{PROG}_<n>.log', flush=True)
+    say(f'{len(queue)} exponents to test on {ngpu} GPU(s); stopping at {hours} h')
+    say(f'progress every {REPORT} iterations, Gerbicz error check every 1,000,000; '
+        f'full logs in {WORK}/ckpt/{PROG}_<n>.log')
     ts = [threading.Thread(target=worker, args=(dev, queue, c, deadline, done), daemon=True)
           for dev in range(ngpu)]
     for t in ts:
         t.start()
     try:
-        t_print = time.time()
         while any(t.is_alive() for t in ts):
             time.sleep(1)
-            if time.time() - t_print >= PROGRESS_EVERY:
-                t_print = time.time()
-                progress_line()
+            show_progress()
     except KeyboardInterrupt:
         STOP.set()
         for p in list(RUNNING):
             p.kill()
         for t in ts:
             t.join(10)
-        print('interrupted: tests stopped; run again to resume from the checkpoints')
+        say('interrupted: tests stopped; run again to resume from the checkpoints')
         return
-    print(f'finished: {len(done)} results in {WORK}/results.json.txt, {len(queue)} exponents not started')
+    say(f'finished: {len(done)} results in {WORK}/results.json.txt, {len(queue)} exponents not started')
 
 
 if __name__ == '__main__':
