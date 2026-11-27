@@ -1,5 +1,5 @@
-# Kaggle runner for hyprp (GPU Fermat PRP of 2^n - c, FP32 + M31 hybrid FFT).
-# Builds hyprp on the Kaggle GPU image (with the CUDA backend when the CUDA toolkit is there, OpenCL otherwise) and
+# Kaggle runner for dfprp (GPU Fermat PRP of 2^n - c, FP32 + M31 hybrid FFT).
+# Builds dfprp (sources hyprp.cpp + hyprp.cl) on the Kaggle GPU image (with the CUDA backend when the CUDA toolkit is there, OpenCL otherwise) and
 # runs a self-test, a verification against Prime95, the T4-Hour benchmark, or a list of exponents (one queue per
 # GPU), resuming checkpoints and results from earlier notebook versions under /kaggle/input.
 # Called by kaggle/hyprp_kaggle.ipynb:
@@ -8,8 +8,9 @@ import argparse, glob, json, os, re, shutil, subprocess, threading, time
 
 WORK = '/kaggle/working'
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = '/kaggle/temp/hyprp-build'
-PROG = 'hyprp'
+BUILD = '/kaggle/temp/dfprp-build'
+PROG = 'dfprp'   # the program's name: executable, results' "program", checkpoint and log files
+SRC = 'hyprp'    # its source files: hyprp.cpp, hyprp.cl
 EXE = os.path.join(BUILD, PROG)
 
 KNOWN = {  # Prime95 30.19 PRP-3 residue-type 1 results for 2^n - 25 (from the project's results.json.txt)
@@ -18,13 +19,14 @@ KNOWN = {  # Prime95 30.19 PRP-3 residue-type 1 results for 2^n - 25 (from the p
     3678855: 'C2A776E50ADE26FA',
     3670849: '6809CE838AE81EF9',
 }
-# RES64 after 3000 iterations, computed with dfprp (an independent double-float FFT program): checks hyprp above
+# RES64 after 3000 iterations, computed with an independent double-float FFT program: checks dfprp above
 # 16 bits/word (32-bit digits) and at 512K words
 CROSS = {4200013: '7490970688C5F822', 4500013: '386AEF1A83E0FA7C', 4574401: '15011123C7996836',
          9000013: '6B4A2A630EE28A6F'}
 PROGRESS_EVERY = 60   # seconds between progress lines
-RUNNING = []          # live hyprp processes, killed on Ctrl+C
-PRECISION = []        # ['--fp64'] or ['--fp32'] to force hyprp's arithmetic (default: hyprp decides)
+RUNNING = []          # live dfprp processes, killed on Ctrl+C
+LIVE = {}             # GPU -> (n, log path) of the test it is running, for the progress line
+PRECISION = []        # ['--fp64'] or ['--fp32'] to force dfprp's arithmetic (default: dfprp decides)
 STOP = threading.Event()
 lock = threading.Lock()
 
@@ -38,7 +40,7 @@ def sh(cmd, check=True):
 
 
 def cuda_flags():
-    """compiler/linker flags for hyprp's CUDA backend (driver API + NVRTC), or None"""
+    """compiler/linker flags for dfprp's CUDA backend (driver API + NVRTC), or None"""
     inc = sh("for d in /usr/local/cuda/include /usr/local/cuda-*/include /usr/include; do "
              "[ -f $d/cuda.h ] && [ -f $d/nvrtc.h ] && echo $d && break; done", False)
     nvrtc = sh("find /usr/local/cuda/ /usr/local/cuda-*/ /usr/lib/x86_64-linux-gnu -name 'libnvrtc.so*' "
@@ -80,9 +82,9 @@ def build():
         open(icd, 'w').write(nvcl + '\n')
         print('wrote', icd)
     inc = os.path.dirname(os.path.dirname(hdr))
-    shutil.copy(os.path.join(REPO, PROG + '.cl'), BUILD)  # hyprp loads its kernel from the exe's folder
+    shutil.copy(os.path.join(REPO, SRC + '.cl'), BUILD)  # the program loads hyprp.cl from the exe's folder
     cmd = (f'g++ -O2 -std=c++17 -DCL_USE_DEPRECATED_OPENCL_1_1_APIS -DCL_USE_DEPRECATED_OPENCL_1_2_APIS '
-           f'-I{inc} {REPO}/{PROG}.cpp -o {EXE} {lib}')
+           f'-I{inc} {REPO}/{SRC}.cpp -o {EXE} {lib}')
     cf = cuda_flags()
     built = False
     if cf:
@@ -91,7 +93,7 @@ def build():
             built = True
             print('built', EXE, '(CUDA on NVIDIA, OpenCL otherwise)')
         else:
-            print('CUDA build of hyprp failed, building it with OpenCL only:\n' + (r.stdout + r.stderr)[-3000:])
+            print('CUDA build of dfprp failed, building it with OpenCL only:\n' + (r.stdout + r.stderr)[-3000:])
     if not built:
         sh(cmd)
         print('built', EXE, '(OpenCL)')
@@ -106,7 +108,7 @@ def gpu_count():
 
 
 def msg(line):
-    """a hyprp output line without its 'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ' time stamp"""
+    """a dfprp output line without its 'YYYY-MM-DD HH:MM:SS UTC+0 [LEVEL] ' time stamp"""
     m = re.match(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\+0 \[\w+\] ', line)
     return line[m.end():] if m else line
 
@@ -120,34 +122,50 @@ def parse(log):
             verdict.group(1) if verdict else None, float(ms.group(1)) if ms else None)
 
 
-def last_progress(path):
+def last_progress(n, path):
+    """a short progress note for one running test, e.g. 'n=4109583 61% ETA 3.5 min'"""
     try:
-        lines = [l for l in open(path).read().splitlines() if ' iter ' in l or 'Gerbicz' in l or 'resumed' in l]
-        return lines[-1] if lines else 'starting'
+        lines = [msg(l) for l in open(path).read().splitlines() if ' iter ' in l or 'resumed' in l]
     except OSError:
-        return 'starting'
+        lines = []
+    m = re.search(r'iter (\d+)/(\d+) .*ETA ([0-9.]+) min', lines[-1]) if lines else None
+    if m:
+        return f'n={n} {100 * int(m.group(1)) // max(1, int(m.group(2)))}% ETA {m.group(3)} min'
+    r = re.search(r'at iteration (\d+)', lines[-1]) if lines else None
+    return f'n={n} resumed at {r.group(1)}' if r else f'n={n} starting'
+
+
+def progress_line():
+    """a line per GPU, printed every PROGRESS_EVERY seconds while tests run; all GPUs' lines go out in one write, so
+    Kaggle's log shows them together without a blank line between them"""
+    with lock:
+        live = sorted(LIVE.items())
+    if live:
+        now = time.strftime('%H:%M UTC', time.gmtime())
+        print('\n'.join(f'{now}  GPU {dev}: {last_progress(n, path)}' for dev, (n, path) in live), flush=True)
 
 
 def run_one(dev, n, c, args, cwd, logname, deadline):
     os.makedirs(cwd, exist_ok=True)
     cmd = [EXE, str(n), str(c), '-dev', str(dev)] + args + PRECISION
-    t0 = t_print = time.time()
+    t0 = time.time()
     path = os.path.join(cwd, logname)
     with open(path, 'w') as lf:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, text=True)
         RUNNING.append(p)
+        with lock:
+            LIVE[dev] = (n, path)
         try:
             while p.poll() is None:
                 if STOP.is_set() or (deadline and time.time() > deadline):
                     p.kill()
                     p.wait()
                     return None, time.time() - t0
-                if time.time() - t_print >= PROGRESS_EVERY:
-                    t_print = time.time()
-                    print(f'[GPU {dev}] n={n}: {last_progress(path)}', flush=True)
                 time.sleep(2)
         finally:
             RUNNING.remove(p)
+            with lock:
+                LIVE.pop(dev, None)
     return open(path).read(), time.time() - t0
 
 
@@ -156,7 +174,7 @@ def tail(log, k=12):
 
 
 def selftest(c):
-    """known residues on GPU 0, then the speed of every GPU (the backend hyprp uses here: CUDA on NVIDIA)"""
+    """known residues on GPU 0, then the speed of every GPU (the backend dfprp uses here: CUDA on NVIDIA)"""
     # full test with Gerbicz checks (small n)
     log, _ = run_one(0, 20011, 25, ['-fresh', '-B', '30'], f'{WORK}/selftest', 'n20011.log', time.time() + 120)
     be = re.search(r'\| (CUDA|OpenCL)', log or '')
@@ -188,11 +206,11 @@ def selftest(c):
 
 
 def bench_all():
-    """hyprp -bench on every GPU, one GPU at a time (1 T4-Hour = what one T4 card computes in one hour);
+    """dfprp -bench on every GPU, one GPU at a time (1 T4-Hour = what one T4 card computes in one hour);
     JSON results in /kaggle/working"""
     os.makedirs(WORK, exist_ok=True)
     for dev in range(gpu_count()):
-        cmd = [EXE, '-bench', '-dev', str(dev), '-out', f'{WORK}/hyprp_bench_gpu{dev}.json'] + PRECISION
+        cmd = [EXE, '-bench', '-dev', str(dev), '-out', f'{WORK}/{PROG}_bench_gpu{dev}.json'] + PRECISION
         r = subprocess.run(cmd, cwd=WORK, text=True, capture_output=True, timeout=1800)
         print(f'===== GPU {dev}')
         print('\n'.join(l for l in (r.stdout + r.stderr).splitlines() if not msg(l).startswith('round ')), flush=True)
@@ -212,8 +230,13 @@ def restore():
     with open(f'{WORK}/results.json.txt', 'w') as out:
         for d in done.values():
             out.write(json.dumps(d) + '\n')
-    for f in glob.glob(f'/kaggle/input/**/{PROG}_*.ckpt', recursive=True):
-        dst = os.path.join(WORK, 'ckpt', os.path.basename(f))
+    # checkpoints saved before the rename are called hyprp_<n>_<c>.ckpt (same contents); a dfprp_ one comes first
+    for f in sorted(glob.glob('/kaggle/input/**/*_*.ckpt', recursive=True),
+                    key=lambda f: not os.path.basename(f).startswith(PROG + '_')):
+        name = os.path.basename(f)
+        if not name.startswith((PROG + '_', 'hyprp_')):
+            continue
+        dst = os.path.join(WORK, 'ckpt', PROG + name[name.index('_'):])
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not os.path.exists(dst):
             shutil.copy(f, dst)
@@ -230,7 +253,6 @@ def worker(dev, queue, c, deadline, done):
             n = queue.pop(0)
         if (n, -c) in done:
             continue
-        print(f'[GPU {dev}] start n={n}', flush=True)
         log, secs = run_one(dev, n, c, ['-report', '250000'], ck, f'{PROG}_{n}.log', deadline)
         if log is None:
             why = 'stopped' if STOP.is_set() else 'time limit'
@@ -243,7 +265,7 @@ def worker(dev, queue, c, deadline, done):
             continue
         be = re.search(r'\| (CUDA|OpenCL)', log)
         uu = re.search(r'\| uuid (GPU-[0-9a-f-]+)', log)  # the physical card: the "computer" of a Kaggle/Colab result
-        cs = re.search(r'checksum ([0-9A-F]{8})', log)    # hyprp's CRC-32 of the result (guards against slips)
+        cs = re.search(r'checksum ([0-9A-F]{8})', log)    # dfprp's CRC-32 of the result (guards against slips)
         ver = re.search(r'Starting dfprp v([0-9.]+)', log)
         d = {'n': n, 'k': 1, 'b': 2, 'c': -c, 'worktype': 'PRP-3', 'residue-type': 1,
              'status': 'P' if verdict.startswith('a probable') else 'C', 'res64': res64, 'res2048': res2048,
@@ -268,7 +290,7 @@ def main(mode, exponents, c, hours):
     t_start = time.time()
     # processes left over from an interrupted run would fight over the GPU and the checkpoint files
     if subprocess.run(['pkill', '-f', BUILD + '/'], capture_output=True).returncode == 0:
-        print('stopped hyprp processes left over from an earlier run (they resume from their checkpoints)')
+        print('stopped dfprp processes left over from an earlier run (they resume from their checkpoints)')
         time.sleep(2)
     build()
     if mode == 'selftest':
@@ -291,8 +313,12 @@ def main(mode, exponents, c, hours):
     for t in ts:
         t.start()
     try:
+        t_print = time.time()
         while any(t.is_alive() for t in ts):
             time.sleep(1)
+            if time.time() - t_print >= PROGRESS_EVERY:
+                t_print = time.time()
+                progress_line()
     except KeyboardInterrupt:
         STOP.set()
         for p in list(RUNNING):
@@ -311,7 +337,7 @@ if __name__ == '__main__':
     ap.add_argument('--exponents', default='', help='comma or space separated list of n')
     ap.add_argument('--hours', type=float, default=11.5)
     ap.add_argument('--precision', choices=['auto', 'fp64', 'fp32'], default='auto',
-                    help='hyprp arithmetic: auto = FP64 on full-rate FP64 GPUs (A100, H100, ...), FP32+M31 elsewhere')
+                    help='dfprp arithmetic: auto = FP64 on full-rate FP64 GPUs (A100, H100, ...), FP32+M31 elsewhere')
     a = ap.parse_args()
     exps = [int(x) for x in re.split(r'[,\s]+', a.exponents) if x.strip().isdigit()]
     for f in glob.glob('/kaggle/input/**/exponents.txt', recursive=True):

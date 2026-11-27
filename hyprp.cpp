@@ -2,8 +2,8 @@
 // twice in one pass: in plain FP32 (approximate) and exactly over GF(p^2), p = 2^31 - 1 (M31). The exact
 // convolution value is rebuilt from the M31 residue and the FP32 approximation, so ~16-18 bits per word fit.
 // FFT length L = 2^k. Gerbicz error check; checkpoint/resume.
-// usage: hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]
-//        hyprp -bench [-dev i] [-quick] [-out file.json]
+// usage: dfprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]
+//        dfprp -bench [-dev i] [-quick] [-out file.json]
 // env:   HYPRP_BACKEND=opencl (use OpenCL even on NVIDIA when built with HYPRP_CUDA)
 // build: OpenCL only, or add -DHYPRP_CUDA and link -lcuda -lnvrtc to run on NVIDIA GPUs through CUDA
 #include <algorithm>
@@ -111,7 +111,7 @@ static bool nearFraction(uint64_t n, uint64_t L) {
     return r < 32 || q - r < 32;
 }
 
-// ---- benchmark: hyprp -bench [-dev i] [-quick] [-out file]
+// ---- benchmark: dfprp -bench [-dev i] [-quick] [-out file]
 // Measures this GPU for every FFT length 16K..2048K. Within one length the time per iteration depends on how digits
 // are stored, which depends on n:
 //   mode 0: 16-bit digits   n <= 16 L
@@ -146,7 +146,7 @@ static int runBench(int argc, char** argv) {
     const bool fp64 = fp64Arg == 1;
     const char* const modeArg = fp64 ? "--fp64" : "--fp32";
     logInfo("benchmark of the %s mode", fp64 ? "FP64" : "FP32+M31");
-    if (out.empty()) out = "hyprp_bench_dev" + std::to_string(dev) + ".json";
+    if (out.empty()) out = "dfprp_bench_dev" + std::to_string(dev) + ".json";
     const double scale = quick ? 0.25 : 1.0;
     const uint32_t K0 = 14, K1 = 21;
     const long long baseIters[8] = {24000, 18000, 12000, 9000, 6000, 3000, 1600, 800};
@@ -217,7 +217,7 @@ static int runBench(int argc, char** argv) {
     for (auto& r : rows) r.best = std::min(r.ms[0], r.ms[1]);
     bool haveRef = true;
     for (auto& r : rows) haveRef = haveRef && T4_REF[r.k - K0][r.mode] > 0;
-    logInfo("hyprp benchmark  device: %s", device.c_str());
+    logInfo("dfprp benchmark  device: %s", device.c_str());
     logInfo("  FFT    n range                 test n      ms/iter (2 rounds)   best     %s mode",
             haveRef ? " x T4  T4-Hours/test " : "");
     double lsum = 0;
@@ -242,7 +242,7 @@ static int runBench(int argc, char** argv) {
     if (j) {
         std::string dv;
         for (char ch : device) { if (ch == '"' || ch == '\\') dv += '\\'; dv += ch; }
-        std::fprintf(j, "{\n  \"program\": \"hyprp\",\n  \"c\": 25,\n  \"arithmetic\": \"%s\",\n  \"device\": \"%s\",\n"
+        std::fprintf(j, "{\n  \"program\": \"dfprp\",\n  \"c\": 25,\n  \"arithmetic\": \"%s\",\n  \"device\": \"%s\",\n"
                         "  \"t4_relative\": %.4f,\n", fp64 ? "FP64" : "FP32+M31", dv.c_str(), score);
         std::fprintf(j, "  \"modes\": [\"%s\", \"%s\"],\n", BENCH_MODE[0], BENCH_MODE[1]);
         std::fprintf(j, "  \"points\": [\n");
@@ -280,9 +280,9 @@ int main(int argc, char** argv) {
     logInfo("All Purpose k*b^n+c PRP tester on GPU");
     if (argc >= 2 && std::string(argv[1]) == "-bench") return runBench(argc, argv);
     if (argc < 2) {
-        std::printf("usage: hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]\n"
+        std::printf("usage: dfprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]\n"
                     "             [--fp64 | --fp32]\n"
-                    "       hyprp -bench [-dev i] [-quick] [-out file.json] [--fp64 | --fp32]\n");
+                    "       dfprp -bench [-dev i] [-quick] [-out file.json] [--fp64 | --fp32]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -342,7 +342,7 @@ int main(int argc, char** argv) {
     // length (the other arithmetic mode), keep the checkpoint's length when it is a longer one or within this mode's
     // bits/word limit; otherwise the checkpoint cannot be used here.
     char ckname[128];
-    std::snprintf(ckname, sizeof(ckname), "hyprp_%u_%lld.ckpt", n, cc);
+    std::snprintf(ckname, sizeof(ckname), "dfprp_%u_%lld.ckpt", n, cc);
     if (gec && iters_limit == 0 && resume && !logL) {
         if (FILE* f = std::fopen(ckname, "rb")) {
             uint64_t hdr[4];
@@ -733,9 +733,9 @@ int main(int argc, char** argv) {
         if (full) {
             logInfo("2^%u-%lld is %s", n, cc, isone ? "a probable prime!" : "composite");
             // checksum of the result, so that a result copied or typed by hand can be checked (it guards against slips,
-            // not against forgery): CRC-32 (zlib / IEEE 802.3) of "hyprp,<version>,1,2,<n>,<-c>,<P|C>,<RES64>,<RES2048>"
+            // not against forgery): CRC-32 (zlib / IEEE 802.3) of "dfprp,<version>,1,2,<n>,<-c>,<P|C>,<RES64>,<RES2048>"
             char head[96];
-            std::snprintf(head, sizeof(head), "hyprp,%s,1,2,%u,%lld,%c,%016llX,", VERSION, n, -cc, isone ? 'P' : 'C', res64);
+            std::snprintf(head, sizeof(head), "dfprp,%s,1,2,%u,%lld,%c,%016llX,", VERSION, n, -cc, isone ? 'P' : 'C', res64);
             logInfo("checksum %08X", crc32Text(std::string(head) + r2048));
         }
     };

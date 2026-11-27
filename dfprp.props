@@ -5,6 +5,7 @@
     <VcpkgInstalled Condition="'$(VcpkgInstalled)' == ''">C:\Users\kelvi\vcpkg\installed\x64-windows</VcpkgInstalled>
   </PropertyGroup>
   <PropertyGroup>
+    <TargetName>dfprp</TargetName>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Configuration)\</IntDir>
     <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
