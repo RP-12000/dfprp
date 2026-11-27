@@ -243,13 +243,13 @@ def worker(dev, queue, c, deadline, done):
             continue
         be = re.search(r'\| (CUDA|OpenCL)', log)
         uu = re.search(r'\| uuid (GPU-[0-9a-f-]+)', log)  # the physical card: the "computer" of a Kaggle/Colab result
-        ck = re.search(r'checksum ([0-9A-F]{8})', log)    # hyprp's CRC-32 of the result (guards against slips)
+        cs = re.search(r'checksum ([0-9A-F]{8})', log)    # hyprp's CRC-32 of the result (guards against slips)
         ver = re.search(r'Starting dfprp v([0-9.]+)', log)
         d = {'n': n, 'k': 1, 'b': 2, 'c': -c, 'worktype': 'PRP-3', 'residue-type': 1,
              'status': 'P' if verdict.startswith('a probable') else 'C', 'res64': res64, 'res2048': res2048,
              'program': PROG, 'backend': be.group(1) if be else None, 'gpu': dev,
              'gpu_uuid': uu.group(1) if uu else None, 'version': ver.group(1) if ver else None,
-             'checksum': ck.group(1) if ck else None, 'seconds': round(secs, 1),
+             'checksum': cs.group(1) if cs else None, 'seconds': round(secs, 1),
              'ms_per_iter': ms, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}
         known = KNOWN.get(n) if c == 25 else None
         if known:
