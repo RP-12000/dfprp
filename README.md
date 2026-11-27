@@ -7,8 +7,9 @@ reports for "PRP-3, residue-type 1". It runs through CUDA on NVIDIA GPUs (when b
 through OpenCL on every other GPU. Open `dfprp.slnx` in Visual Studio 2026, or run `build.bat` (Release by default;
 the Windows build uses OpenCL).
 
-**Supported so far:** k = 1, b = 2: N = 2^n − c with c > 0 a square mod 2^31 − 1 (hyprp checks this at the start;
-tested with c = 25), n up to 34,603,008. Other k, b and +c are not implemented yet.
+**Supported so far:** k = 1, b = 2: N = 2^n − c with c > 0 (tested with c = 25; the FP32 + M31 mode also needs c to
+be a square mod 2^31 − 1, which hyprp checks at the start), n up to 34,603,008. Other k, b and +c are not
+implemented yet.
 
 ## How it works
 
@@ -27,6 +28,10 @@ tested with c = 25), n up to 34,603,008. Other k, b and +c are not implemented y
   (about bits/word + log2(c) + 13 bits) is split into a part for the next element and a part for the one after,
   packed into one 64-bit word per element (8 bytes, whatever the word size).
 * `hyprp.cl` is written so it compiles as OpenCL C and as CUDA C++ (NVRTC); `gpu_backend.h` has the two backends.
+* **FP64 mode** (`--fp64`): the same transform as a plain double-precision complex FFT, no M31 part. It is meant for
+  GPUs with full-rate FP64 (P100, V100, A100, H100, B200), which use it by default; everywhere else FP32 + M31 is
+  the default (`--fp32` forces it). Both modes give the same residues. With c = 25 the weights c^(j/L) span a factor
+  25, which costs FP64 about 2 bits/word, so it holds 0.7–1 bit/word less than FP32 + M31 at the same length.
 
 `hyprp.exe` loads `hyprp.cl` from its own folder at run time; the project copies it to `bin\<Configuration>\`.
 
@@ -36,22 +41,29 @@ The length is the smallest power of two whose bits/word stay under the limit bel
 surveys on a Kaggle T4 and a Radeon 780M (two or three n per point) and give a worst maxerr of about 0.27 at each
 cutoff. n within 32 of a multiple of L/4 (more round-off) takes the next length.
 
-| FFT length | bits/word | largest n |
-|---|---|---|
-| ≤ 128K | 17.7 | 2,319,974 (128K) |
-| 256K | 17.45 | 4,574,412 |
-| 512K | 17.2 | 9,017,753 |
-| 1024K | 16.95 | 17,773,363 |
-| 2048K | 16.5 | 34,603,008 |
+| FFT length | bits/word FP32 + M31 | largest n | bits/word FP64 | largest n |
+|---|---|---|---|---|
+| ≤ 16K | 17.7 | 289,996 (16K) | 17.5 | 286,720 (16K) |
+| 32K | 17.7 | 579,993 | 17.25 | 565,248 |
+| 64K | 17.7 | 1,159,987 | 17.0 | 1,114,112 |
+| 128K | 17.7 | 2,319,974 | 16.75 | 2,195,456 |
+| 256K | 17.45 | 4,574,412 | 16.4 | 4,299,161 |
+| 512K | 17.2 | 9,017,753 | 16.15 | 8,467,251 |
+| 1024K | 16.95 | 17,773,363 | 15.8 | 16,567,500 |
+| 2048K | 16.5 | 34,603,008 | 15.5 | 32,505,856 |
 
-Larger n (longer lengths were not measured) are refused.
+The FP64 limits come from round-off surveys on a Radeon 780M (OpenCL). Larger n (longer lengths were not measured)
+are refused.
 
 ## Running
 
 ```
-hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-dev i]
-hyprp -bench [-dev i] [-quick] [-out file.json]
+hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gerbicz_block] [-nogec] [-fresh] [-dev i] [--fp64 | --fp32]
+hyprp -bench [-dev i] [-quick] [-out file.json] [--fp64 | --fp32]
 ```
+
+* `--fp64` / `--fp32` choose the arithmetic; without them it follows the GPU (FP64 on full-rate FP64 GPUs). A
+  checkpoint written in one mode resumes in the other when its FFT length is long enough there.
 
 * Every line hyprp prints starts with the UTC time and a level (INFO, WARN, FATAL), as in Mass Prime Siever's log:
   `2026-11-25 06:18:45 UTC+0 [INFO] RES64 7490970688C5F822`.
@@ -76,7 +88,7 @@ seconds, and their time per iteration is close to the 16K time.
 (CUDA + NVRTC when the toolkit is there, OpenCL otherwise). Use a GPU T4 x2 accelerator with Internet on and pick
 `MODE = 'selftest'` (build; known residues, including n above 16 bits/word and at 512K; speed of each GPU),
 `'verify'` (full tests of exponents Prime95 already did), `'bench'` (the T4-Hour benchmark, one GPU at a time) or
-`'run'` (an exponent list; results in `results.jsonl`, checkpoints resume across sessions, one queue per GPU).
+`'run'` (an exponent list; results in `results.json.txt`, checkpoints resume across sessions, one queue per GPU).
 The notebook runs whatever is on GitHub, so push changes before running it.
 
 ## Speed (one Kaggle T4)

@@ -1,5 +1,8 @@
-// hyprp: weighted real FFT mod 2^n - c (four-step W x H: fwdW, tail, invW), computed twice at once: in FP32
-// (approximate) and exactly in GF(p^2), p = M31 = 2^31 - 1 (a "complex" NTT; i^2 = -1).
+// hyprp: weighted real FFT mod 2^n - c (four-step W x H: fwdW, tail, invW). Two arithmetic modes:
+// - default (FP32 + M31): computed twice at once, in FP32 (approximate) and exactly in GF(p^2), p = M31 = 2^31 - 1
+//   (a "complex" NTT; i^2 = -1);
+// - FP64 (#define FP64): a plain double-precision complex FFT, for GPUs with full-rate FP64 (P100, V100, A100,
+//   H100, B200); the description below of values, weights and rounding is that of the default mode.
 // Every complex value is a float4: .x/.y = FP32 complex, .z/.w = the GF(p^2) element (bit pattern of two uints).
 // The exact result z_j of the convolution is rebuilt as z = r + p * round((z_fp32 - r) / p) with r = z mod p
 // from the NTT, so the FP32 part only has to be accurate to +-p/2 and words can be ~15-17 bits wide.
@@ -26,6 +29,7 @@ typedef unsigned long long ulong;  // long is 64-bit on the LP64 Linux targets
 DEVFN uint group_id() { return blockIdx.x; }
 DEVFN uint local_id() { return threadIdx.x; }
 DEVFN float4 F4(float a, float b, float c, float d) { return make_float4(a, b, c, d); }
+DEVFN double2 D2(double a, double b) { return make_double2(a, b); }
 DEVFN int2 I2(int a, int b) { return make_int2(a, b); }
 #ifdef DIG16
 typedef short2 DT;
@@ -44,6 +48,10 @@ DEVFN float U2F(uint u) { return __uint_as_float(u); }
 #define LDEXPF ldexpf
 DEVFN uint atom_max(uint* p, uint v) { return atomicMax(p, v); }
 #else
+#ifdef FP64
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#define D2(a, b) ((double2)((a), (b)))
+#endif
 #define KERNEL __kernel __attribute__((reqd_work_group_size(WG, 1, 1))) void
 #define GLOBAL __global
 #define LOCAL __local
@@ -72,14 +80,34 @@ typedef long CS;  // packed carry
 #define atom_max atomic_max
 #endif
 
-typedef float2 df;     // weight table entry: (FP32 weight, bits of the GF(p) weight factor)
-typedef float4 C;
 #define NC (W * H)
 #define LL (2 * NC)
 #ifndef WG
 #define WG 64
 #endif
 #define WS 512u  // weight table split: j = jh * WS + jl
+
+// ---- packed carries: lo in bits 24..63, q2 in bits 0..23 (two's complement)
+DEVFN CS packCY(long lo, long q2) { return (CS)(((ulong)lo << 24) | ((ulong)q2 & 0xFFFFFFul)); }
+DEVFN long cyLo(CS v) { return (long)(v >> 24); }
+DEVFN long cyHi(CS v) { return (long)((CS)((ulong)v << 40) >> 40); }
+
+#ifdef FP64
+// ---- FP64 mode: double-precision complex values
+typedef double df;     // weight table entry: the weight
+typedef double2 C;
+#define SQRT1_2D 0.70710678118654752440
+DEVFN C cadd(C a, C b) { return D2(a.x + b.x, a.y + b.y); }
+DEVFN C csub(C a, C b) { return D2(a.x - b.x, a.y - b.y); }
+DEVFN C cmul(C a, C b) { return D2(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x)); }
+DEVFN C conjg(C a) { return D2(a.x, -a.y); }
+DEVFN C mulmi(C a, int dir) { return dir > 0 ? D2(a.y, -a.x) : D2(-a.y, a.x); }  // * -i (forward) or * +i
+DEVFN C muli(C a) { return D2(-a.y, a.x); }
+DEVFN C chalf(C a) { return D2(a.x * 0.5, a.y * 0.5); }
+DEVFN C csqrthalf(C a) { return D2(a.x * SQRT1_2D, a.y * SQRT1_2D); }
+#else
+typedef float2 df;     // weight table entry: (FP32 weight, bits of the GF(p) weight factor)
+typedef float4 C;
 #define MP 0x7FFFFFFFu
 #define SQRT1_2F 0.70710678118654752440f
 
@@ -94,11 +122,6 @@ DEVFN uint mmul(uint a, uint b) {
 }
 DEVFN uint mrot(uint x, uint s) { return s ? (((x << s) & MP) | (x >> (31 - s))) : x; }  // x * 2^s, s < 31
 DEVFN uint mhalf(uint x) { return (x >> 1) | ((x & 1u) << 30); }                     // x / 2
-
-// ---- packed carries: lo in bits 24..63, q2 in bits 0..23 (two's complement)
-DEVFN CS packCY(long lo, long q2) { return (CS)(((ulong)lo << 24) | ((ulong)q2 & 0xFFFFFFul)); }
-DEVFN long cyLo(CS v) { return (long)(v >> 24); }
-DEVFN long cyHi(CS v) { return (long)((CS)((ulong)v << 40) >> 40); }
 
 // ---- hybrid complex values
 DEVFN C MKH(float fx, float fy, uint mx, uint my) { return F4(fx, fy, U2F(mx), U2F(my)); }
@@ -119,6 +142,7 @@ DEVFN C mulmi(C a, int dir) {
 DEVFN C muli(C a) { return MKH(-a.y, a.x, mneg(MIM(a)), MRE(a)); }
 DEVFN C chalf(C a) { return MKH(a.x * 0.5f, a.y * 0.5f, mhalf(MRE(a)), mhalf(MIM(a))); }
 DEVFN C csqrthalf(C a) { return MKH(a.x * SQRT1_2F, a.y * SQRT1_2F, mrot(MRE(a), 15), mrot(MIM(a), 15)); }
+#endif
 
 DEVFN void dft2(C* x) { C t = x[0]; x[0] = cadd(t, x[1]); x[1] = csub(t, x[1]); }
 DEVFN void dft4(C* x, int dir) {
@@ -189,6 +213,13 @@ DEVFN uint Bpos2(GLOBAL const uint* it, uint j, uint* ce, uint* rs) {
     return it[NH + WS + jh] + it[2 * NH + WS + jl] + *ce;
 }
 DEVFN uint Bpos(GLOBAL const uint* it, uint j, uint* ce) { uint rs; return Bpos2(it, j, ce, &rs); }
+#ifdef FP64
+// wtab = [WH(NH) | WL(WS) | iWH(NH) | iWL(WS)] as doubles (the inverse weights include 1/N)
+DEVFN double wgtF(GLOBAL const df* wt, uint j, uint ce) { return ldexp(wt[j / WS] * wt[NH + j % WS], (int)ce); }
+DEVFN double iwgtF(GLOBAL const df* wt, uint j, uint ce) {
+    return ldexp(wt[NH + WS + j / WS] * wt[2 * NH + WS + j % WS], -(int)ce);
+}
+#else
 // GF(p) weight 2^((ce L - rs)/L) = 2^(MU (ce L - rs) mod 31): a rotation
 DEVFN uint wrot(uint ce, uint rs) {  // ce <= 2, rs <= 2 LL: everything fits in 32 bits
     const uint v = (ce * (LL % 31u) + 62u - rs % 31u) % 31u;
@@ -205,6 +236,8 @@ DEVFN uint iwgtM(GLOBAL const df* wt, uint j, uint ce, uint rs) {  // includes 1
     return mrot(mmul(F2U(wt[NH + WS + j / WS].y), F2U(wt[2 * NH + WS + j % WS].y)),
                 (62 - wrot(ce, rs) - (LOGN % 31)) % 31);
 }
+DEVFN uint tomod(long d) { return d < 0 ? (uint)(d + MP) : (uint)d; }  // |d| < p
+#endif
 
 DEVFN long bal(long v, uint b, long* carry) {
     const long base = 1L << b, hb = base >> 1;
@@ -212,13 +245,20 @@ DEVFN long bal(long v, uint b, long* carry) {
     *carry = (v - d) >> b;
     return d;
 }
-DEVFN uint tomod(long d) { return d < 0 ? (uint)(d + MP) : (uint)d; }  // |d| < p
 
 // twN1[i] = w_N^i for i < W ; twN2[i] = w_N^(W i) = w_H^i for i < H
 DEVFN C twN(GLOBAL const C* twN1, GLOBAL const C* twN2, uint e) { return cmul(twN1[e % W], twN2[e / W]); }
 #define TWN(e) twN(twN1, twN2, (e))
 
-// digits (d0, d1) of complex element m -> weighted hybrid value
+// digits (d0, d1) of complex element m -> weighted value
+#ifdef FP64
+DEVFN C weighed(GLOBAL const df* WT, GLOBAL const uint* IT, uint m, long d0, long d1) {
+    uint ce0, ce1;
+    Bpos(IT, 2 * m, &ce0);
+    Bpos(IT, 2 * m + 1, &ce1);
+    return D2((double)d0 * wgtF(WT, 2 * m, ce0), (double)d1 * wgtF(WT, 2 * m + 1, ce1));
+}
+#else
 DEVFN C weighed(GLOBAL const df* WT, GLOBAL const uint* IT, uint m, long d0, long d1) {
     uint ce0, ce1, rs0, rs1;
     Bpos2(IT, 2 * m, &ce0, &rs0);
@@ -226,6 +266,7 @@ DEVFN C weighed(GLOBAL const df* WT, GLOBAL const uint* IT, uint m, long d0, lon
     return MKH((float)d0 * wgtF(WT, 2 * m, ce0), (float)d1 * wgtF(WT, 2 * m + 1, ce1),
                mmul(tomod(d0), wgtM(WT, 2 * m, ce0, rs0)), mmul(tomod(d1), wgtM(WT, 2 * m + 1, ce1, rs1)));
 }
+#endif
 
 KERNEL fwdW(GLOBAL const DT* D, GLOBAL const CS* CY, GLOBAL const df* WT, GLOBAL C* A,
             GLOBAL const C* twW, GLOBAL const C* twN1, GLOBAL const C* twN2, GLOBAL const uint* IT) {
@@ -345,6 +386,7 @@ KERNEL tailMul(GLOBAL C* A, GLOBAL const C* twH, GLOBAL const C* twN1, GLOBAL co
     tailImpl(s1, A, Bf, twH, twN1, twN2, 2);
 }
 
+#ifndef FP64
 // exact value z from the FP32 approximation zf and the residue r = z mod p; err = distance of (zf - r)/p from an
 // integer (must stay well below 0.5)
 DEVFN long hround(float zf, uint r, float* err) {
@@ -354,6 +396,7 @@ DEVFN long hround(float zf, uint r, float* err) {
     *err = FABSF(q - tq);
     return (long)r + (long)tq * (long)MP;
 }
+#endif
 
 // inverse half for element m of value v: rounded digits (d0, d1) and the split carry; returns the round-off
 DEVFN float unweigh(GLOBAL const df* WT, GLOBAL const uint* IT, uint m, C v, int mulc, int2* dig, long* cy) {
@@ -361,8 +404,16 @@ DEVFN float unweigh(GLOBAL const df* WT, GLOBAL const uint* IT, uint m, C v, int
     uint B0 = Bpos2(IT, 2 * m, &ce0, &rs0), B1 = Bpos2(IT, 2 * m + 1, &ce1, &rs1), B2 = Bpos(IT, 2 * m + 2, &ce2);
     uint B4 = Bpos(IT, 2 * m + 4, &ce4);
     float e0, e1;
+#ifdef FP64
+    const double x0 = v.x * iwgtF(WT, 2 * m, ce0), x1 = v.y * iwgtF(WT, 2 * m + 1, ce1);
+    const double t0 = rint(x0), t1 = rint(x1);
+    e0 = (float)fabs(x0 - t0);
+    e1 = (float)fabs(x1 - t1);
+    long r0 = (long)t0, r1 = (long)t1;
+#else
     long r0 = hround(v.x * iwgtF(WT, 2 * m, ce0), mmul(MRE(v), iwgtM(WT, 2 * m, ce0, rs0)), &e0);
     long r1 = hround(v.y * iwgtF(WT, 2 * m + 1, ce1), mmul(MIM(v), iwgtM(WT, 2 * m + 1, ce1, rs1)), &e1);
+#endif
     long c0, c1;
     long d0 = bal(r0 * mulc, B1 - B0, &c0);
     long d1 = bal(r1 * mulc + c0, B2 - B1, &c1);

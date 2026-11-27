@@ -28,6 +28,10 @@ class Gpu {
 public:
     virtual ~Gpu() {}
     std::string name, backend;
+    bool fp64Fast = false;  // FP64 at half the FP32 rate (P100, V100, A100, H100, B200): hyprp's FP64 mode pays off
+    // the card's UUID as nvidia-smi writes it ("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"); "" when the driver gives
+    // none. It names the physical card: on Kaggle or Colab each session gets another one.
+    std::string uuid;
     // compiles source (the backend adds its own defines); returns false and fills log on error
     virtual bool build(const std::string& src, std::string& log) = 0;
     virtual GpuKernel kernel(const char* name) = 0;
@@ -45,7 +49,15 @@ public:
     virtual void finish() = 0;
 };
 
-#define GCHECK(e, what)                                                                     \
+// 16 UUID bytes -> "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (nvidia-smi's form)
+inline std::string uuidText(const unsigned char* b) {
+    char s[48];
+    std::snprintf(s, sizeof(s), "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0], b[1],
+                  b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return s;
+}
+
+#define GCHECK(e, what)                                                                   \
     do {                                                                                    \
         long long _e = (long long)(e);                                                      \
         if (_e != 0) { logFatal("%s error %lld at %s:%d", what, _e, __FILE__, __LINE__); std::exit(1); } \
@@ -91,8 +103,11 @@ public:
         clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lmem), &lmem, nullptr);
         clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, nullptr);
         name = nm;
-        logInfo("device: %s | %s | driver %s | %u CU @ %u MHz | local %llu KB | global %llu MB | OpenCL", nm, ver, drv,
-                cus, clk, (unsigned long long)lmem / 1024, (unsigned long long)gmem >> 20);
+        unsigned char ub[16];  // cl_khr_device_uuid: CL_DEVICE_UUID_KHR = 0x106A, 16 bytes
+        if (clGetDeviceInfo(dev, 0x106A, 16, ub, nullptr) == CL_SUCCESS) uuid = uuidText(ub);
+        logInfo("device: %s | %s | driver %s | %u CU @ %u MHz | local %llu KB | global %llu MB | OpenCL | uuid %s", nm,
+                ver, drv, cus, clk, (unsigned long long)lmem / 1024, (unsigned long long)gmem >> 20,
+                uuid.empty() ? "unknown" : uuid.c_str());
         cl_int err;
         ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
         GCHECK(err, "OpenCL");
@@ -210,8 +225,15 @@ public:
         size_t mem = 0;
         cuDeviceTotalMem(&mem, dev);
         name = nm;
-        logInfo("device: %s | compute %d.%d | CUDA driver %d | %d SM | global %llu MB | CUDA", nm, ccMajor, ccMinor,
-                drv, sms, (unsigned long long)mem >> 20);
+        // half-rate FP64: P100 (6.0), V100 (7.0), A100 (8.0), H100 (9.0), B200 (10.0); the others run it at 1/32-1/64
+        // (compute 12.0 is consumer/workstation Blackwell, RTX 50 and RTX PRO 6000)
+        const int cc = ccMajor * 10 + ccMinor;
+        fp64Fast = cc == 60 || cc == 70 || cc == 80 || cc == 90 || cc == 100;
+        CUuuid cu;
+        if (cuDeviceGetUuid(&cu, dev) == CUDA_SUCCESS) uuid = uuidText((const unsigned char*)cu.bytes);
+        logInfo("device: %s | compute %d.%d | CUDA driver %d | %d SM | global %llu MB | CUDA%s | uuid %s", nm, ccMajor,
+                ccMinor, drv, sms, (unsigned long long)mem >> 20, fp64Fast ? " | full-rate FP64" : "",
+                uuid.empty() ? "unknown" : uuid.c_str());
         GCHECK(cuDevicePrimaryCtxRetain(&ctx, dev), "CUDA");
         GCHECK(cuCtxSetCurrent(ctx), "CUDA");
     }

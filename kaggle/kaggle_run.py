@@ -24,6 +24,7 @@ CROSS = {4200013: '7490970688C5F822', 4500013: '386AEF1A83E0FA7C', 4574401: '150
          9000013: '6B4A2A630EE28A6F'}
 PROGRESS_EVERY = 60   # seconds between progress lines
 RUNNING = []          # live hyprp processes, killed on Ctrl+C
+PRECISION = []        # ['--fp64'] or ['--fp32'] to force hyprp's arithmetic (default: hyprp decides)
 STOP = threading.Event()
 lock = threading.Lock()
 
@@ -57,6 +58,8 @@ def cuda_flags():
 
 
 def build():
+    if subprocess.run('nvidia-smi -L', shell=True, capture_output=True).returncode != 0:
+        raise SystemExit('no NVIDIA GPU in this session: Settings -> Accelerator -> GPU T4 x2, then run again')
     os.makedirs(BUILD, exist_ok=True)
     hdr = sh("find /usr/local/cuda/ /usr/include /usr/local/include -path '*CL/cl.h' 2>/dev/null | head -1", False)
     lib = sh("find /usr/local/cuda/ /usr/lib/x86_64-linux-gnu -name 'libOpenCL.so*' 2>/dev/null | sort | head -1", False)
@@ -127,7 +130,7 @@ def last_progress(path):
 
 def run_one(dev, n, c, args, cwd, logname, deadline):
     os.makedirs(cwd, exist_ok=True)
-    cmd = [EXE, str(n), str(c), '-dev', str(dev)] + args
+    cmd = [EXE, str(n), str(c), '-dev', str(dev)] + args + PRECISION
     t0 = t_print = time.time()
     path = os.path.join(cwd, logname)
     with open(path, 'w') as lf:
@@ -189,7 +192,7 @@ def bench_all():
     JSON results in /kaggle/working"""
     os.makedirs(WORK, exist_ok=True)
     for dev in range(gpu_count()):
-        cmd = [EXE, '-bench', '-dev', str(dev), '-out', f'{WORK}/hyprp_bench_gpu{dev}.json']
+        cmd = [EXE, '-bench', '-dev', str(dev), '-out', f'{WORK}/hyprp_bench_gpu{dev}.json'] + PRECISION
         r = subprocess.run(cmd, cwd=WORK, text=True, capture_output=True, timeout=1800)
         print(f'===== GPU {dev}')
         print('\n'.join(l for l in (r.stdout + r.stderr).splitlines() if not msg(l).startswith('round ')), flush=True)
@@ -198,7 +201,7 @@ def bench_all():
 def restore():
     """copy checkpoints and earlier results from /kaggle/input into /kaggle/working"""
     done = {}
-    for f in glob.glob('/kaggle/input/**/results.jsonl', recursive=True):
+    for f in glob.glob('/kaggle/input/**/results.json.txt', recursive=True):
         for line in open(f):
             try:
                 d = json.loads(line)
@@ -206,7 +209,7 @@ def restore():
             except Exception:
                 pass
     os.makedirs(WORK, exist_ok=True)
-    with open(f'{WORK}/results.jsonl', 'w') as out:
+    with open(f'{WORK}/results.json.txt', 'w') as out:
         for d in done.values():
             out.write(json.dumps(d) + '\n')
     for f in glob.glob(f'/kaggle/input/**/{PROG}_*.ckpt', recursive=True):
@@ -239,9 +242,14 @@ def worker(dev, queue, c, deadline, done):
             print(f'[GPU {dev}] n={n} failed:\n' + log[-2000:], flush=True)
             continue
         be = re.search(r'\| (CUDA|OpenCL)', log)
+        uu = re.search(r'\| uuid (GPU-[0-9a-f-]+)', log)  # the physical card: the "computer" of a Kaggle/Colab result
+        ck = re.search(r'checksum ([0-9A-F]{8})', log)    # hyprp's CRC-32 of the result (guards against slips)
+        ver = re.search(r'Starting dfprp v([0-9.]+)', log)
         d = {'n': n, 'k': 1, 'b': 2, 'c': -c, 'worktype': 'PRP-3', 'residue-type': 1,
              'status': 'P' if verdict.startswith('a probable') else 'C', 'res64': res64, 'res2048': res2048,
-             'program': PROG, 'backend': be.group(1) if be else None, 'gpu': dev, 'seconds': round(secs, 1),
+             'program': PROG, 'backend': be.group(1) if be else None, 'gpu': dev,
+             'gpu_uuid': uu.group(1) if uu else None, 'version': ver.group(1) if ver else None,
+             'checksum': ck.group(1) if ck else None, 'seconds': round(secs, 1),
              'ms_per_iter': ms, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}
         known = KNOWN.get(n) if c == 25 else None
         if known:
@@ -249,7 +257,7 @@ def worker(dev, queue, c, deadline, done):
             d['matches_prime95'] = known == res64
         with lock:
             done[(n, -c)] = d
-            with open(f'{WORK}/results.jsonl', 'a') as out:
+            with open(f'{WORK}/results.json.txt', 'a') as out:
                 out.write(json.dumps(d) + '\n')
         flag = '' if not known else ('  MATCHES Prime95' if known == res64 else f'  DIFFERS from Prime95 {known}')
         print(f'[GPU {dev}] n={n} {"PRP!" if d["status"] == "P" else "composite"} RES64 {res64} '
@@ -293,7 +301,7 @@ def main(mode, exponents, c, hours):
             t.join(10)
         print('interrupted: tests stopped; run again to resume from the checkpoints')
         return
-    print(f'finished: {len(done)} results in {WORK}/results.jsonl, {len(queue)} exponents not started')
+    print(f'finished: {len(done)} results in {WORK}/results.json.txt, {len(queue)} exponents not started')
 
 
 if __name__ == '__main__':
@@ -302,8 +310,12 @@ if __name__ == '__main__':
     ap.add_argument('--c', type=int, default=25)
     ap.add_argument('--exponents', default='', help='comma or space separated list of n')
     ap.add_argument('--hours', type=float, default=11.5)
+    ap.add_argument('--precision', choices=['auto', 'fp64', 'fp32'], default='auto',
+                    help='hyprp arithmetic: auto = FP64 on full-rate FP64 GPUs (A100, H100, ...), FP32+M31 elsewhere')
     a = ap.parse_args()
     exps = [int(x) for x in re.split(r'[,\s]+', a.exponents) if x.strip().isdigit()]
     for f in glob.glob('/kaggle/input/**/exponents.txt', recursive=True):
         exps += [int(x) for x in open(f).read().split() if x.strip().isdigit()]
+    if a.precision != 'auto':
+        PRECISION.append('--' + a.precision)
     main(a.mode, list(dict.fromkeys(exps)), a.c, a.hours)

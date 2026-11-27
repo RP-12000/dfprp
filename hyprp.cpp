@@ -94,8 +94,14 @@ static int64_t invmod(int64_t a, int64_t m) {  // a^-1 mod m, gcd(a, m) = 1
 
 static uint32_t ilog2(uint64_t v) { uint32_t l = 0; while ((1ull << l) < v) ++l; return l; }
 
-// largest bits/word for FFT length 2^k (see the length choice in main); 0 = length not supported
-static double maxBitsFor(uint32_t k) {
+// largest bits/word for FFT length 2^k (see the length choice in main); 0 = length not supported.
+// FP64 mode: from round-off surveys on a Radeon 780M (OpenCL), worst maxerr about 0.27 at each cutoff as in the
+// default mode. With c = 25 the DWT weights c^(j/L) span a factor 25, which costs FP64 about 2 bits/word, so it holds
+// 0.7-1 bit/word less than FP32 + M31 at the same length.
+static double maxBitsFor(uint32_t k, bool fp64) {
+    if (fp64)
+        return k <= 14 ? 17.5 : k == 15 ? 17.25 : k == 16 ? 17.0 : k == 17 ? 16.75 : k == 18 ? 16.4 : k == 19 ? 16.15
+             : k == 20 ? 15.8 : k == 21 ? 15.5 : 0;
     return k <= 17 ? 17.7 : k == 18 ? 17.45 : k == 19 ? 17.2 : k == 20 ? 16.95 : k == 21 ? 16.5 : 0;
 }
 // n within 32 of a multiple of L/4: more round-off, the next length is used
@@ -125,14 +131,21 @@ static const char* const BENCH_MODE[2] = {"16-bit digits", "32-bit digits"};
 static int runBench(int argc, char** argv) {
     int dev = 0;
     bool quick = false;
+    int fp64Arg = -1;  // -1: as the GPU suggests (FP64 on full-rate FP64 GPUs)
     std::string out;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-dev" && i + 1 < argc) dev = std::atoi(argv[++i]);
         else if (a == "-quick") quick = true;
         else if (a == "-out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--fp64" || a == "-fp64") fp64Arg = 1;
+        else if (a == "--fp32" || a == "-fp32") fp64Arg = 0;
         else { logFatal("bad arg %s", a.c_str()); return 1; }
     }
+    if (fp64Arg < 0) fp64Arg = makeGpu(dev, false)->fp64Fast ? 1 : 0;
+    const bool fp64 = fp64Arg == 1;
+    const char* const modeArg = fp64 ? "--fp64" : "--fp32";
+    logInfo("benchmark of the %s mode", fp64 ? "FP64" : "FP32+M31");
     if (out.empty()) out = "hyprp_bench_dev" + std::to_string(dev) + ".json";
     const double scale = quick ? 0.25 : 1.0;
     const uint32_t K0 = 14, K1 = 21;
@@ -141,8 +154,8 @@ static int runBench(int argc, char** argv) {
     std::vector<Row> rows;
     for (uint32_t k = K0; k <= K1; ++k) {
         const uint64_t L = 1ull << k;
-        const uint64_t top = (uint64_t)((double)L * maxBitsFor(k));
-        const uint64_t lo = (k > 6) ? (uint64_t)((double)(L / 2) * maxBitsFor(k - 1)) + 1 : 1;  // smallest n using L
+        const uint64_t top = (uint64_t)((double)L * maxBitsFor(k, fp64));
+        const uint64_t lo = (k > 6) ? (uint64_t)((double)(L / 2) * maxBitsFor(k - 1, fp64)) + 1 : 1;  // smallest n using L
         const uint64_t edges[3] = {lo, 16 * L + 1, top + 1};
         for (uint32_t mode = 0; mode < 2; ++mode) {
             const uint64_t from = std::max(edges[mode], lo), to = std::min(edges[mode + 1] - 1, top);
@@ -160,12 +173,12 @@ static int runBench(int argc, char** argv) {
             const long long it = std::max<long long>(200, (long long)(baseIters[r.k - K0] * scale)) / 4 * 4;
             char cmd[2048];
 #ifdef _WIN32
-            std::snprintf(cmd, sizeof(cmd), "\"\"%s\" %llu -L %u -iters %lld -report %lld -dev %d 2>&1\"", exe.c_str(),
-                          (unsigned long long)r.n, r.k, it, it / 4, dev);
+            std::snprintf(cmd, sizeof(cmd), "\"\"%s\" %llu -L %u -iters %lld -report %lld -dev %d %s 2>&1\"", exe.c_str(),
+                          (unsigned long long)r.n, r.k, it, it / 4, dev, modeArg);
             FILE* f = _popen(cmd, "r");
 #else
-            std::snprintf(cmd, sizeof(cmd), "\"%s\" %llu -L %u -iters %lld -report %lld -dev %d 2>&1", exe.c_str(),
-                          (unsigned long long)r.n, r.k, it, it / 4, dev);
+            std::snprintf(cmd, sizeof(cmd), "\"%s\" %llu -L %u -iters %lld -report %lld -dev %d %s 2>&1", exe.c_str(),
+                          (unsigned long long)r.n, r.k, it, it / 4, dev, modeArg);
             FILE* f = popen(cmd, "r");
 #endif
             if (!f) { logFatal("cannot start %s", exe.c_str()); return 1; }
@@ -229,8 +242,8 @@ static int runBench(int argc, char** argv) {
     if (j) {
         std::string dv;
         for (char ch : device) { if (ch == '"' || ch == '\\') dv += '\\'; dv += ch; }
-        std::fprintf(j, "{\n  \"program\": \"hyprp\",\n  \"c\": 25,\n  \"device\": \"%s\",\n  \"t4_relative\": %.4f,\n",
-                     dv.c_str(), score);
+        std::fprintf(j, "{\n  \"program\": \"hyprp\",\n  \"c\": 25,\n  \"arithmetic\": \"%s\",\n  \"device\": \"%s\",\n"
+                        "  \"t4_relative\": %.4f,\n", fp64 ? "FP64" : "FP32+M31", dv.c_str(), score);
         std::fprintf(j, "  \"modes\": [\"%s\", \"%s\"],\n", BENCH_MODE[0], BENCH_MODE[1]);
         std::fprintf(j, "  \"points\": [\n");
         for (size_t i = 0; i < rows.size(); ++i) {
@@ -252,13 +265,24 @@ static int runBench(int argc, char** argv) {
 static const char* const VERSION = "1.0";
 static const char* const DEVELOPED = "2026.11.25";
 
+// CRC-32 as zlib computes it (polynomial 0xEDB88320, initial and final XOR 0xFFFFFFFF)
+static uint32_t crc32Text(const std::string& s) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (unsigned char ch : s) {
+        c ^= ch;
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
 int main(int argc, char** argv) {
     logInfo("Starting dfprp v%s, Developed on %s", VERSION, DEVELOPED);
     logInfo("All Purpose k*b^n+c PRP tester on GPU");
     if (argc >= 2 && std::string(argv[1]) == "-bench") return runBench(argc, argv);
     if (argc < 2) {
         std::printf("usage: hyprp n [c=25] [-L log2L] [-iters k] [-report k] [-prof] [-B gec_block] [-nogec] [-fresh] [-dev i]\n"
-                    "       hyprp -bench [-dev i] [-quick] [-out file.json]\n");
+                    "             [--fp64 | --fp32]\n"
+                    "       hyprp -bench [-dev i] [-quick] [-out file.json] [--fp64 | --fp32]\n");
         return 1;
     }
     const uint32_t n = (uint32_t)std::atoi(argv[1]);
@@ -272,9 +296,12 @@ int main(int argc, char** argv) {
     long long report = 100000;
     int GB = 1000;  // Gerbicz block size (check every GB^2 iterations)
     bool gec = true, resume = true;
+    int fp64Arg = -1;  // -1: FP64 on GPUs with full-rate FP64, FP32+M31 elsewhere; --fp64 / --fp32 force one
     for (; ai < argc; ++ai) {
         std::string a = argv[ai];
-        if (a == "-L" && ai + 1 < argc) logL = std::atoi(argv[++ai]);
+        if (a == "--fp64" || a == "-fp64") fp64Arg = 1;
+        else if (a == "--fp32" || a == "-fp32") fp64Arg = 0;
+        else if (a == "-L" && ai + 1 < argc) logL = std::atoi(argv[++ai]);
         else if (a == "-iters" && ai + 1 < argc) iters_limit = std::atoll(argv[++ai]);
         else if (a == "-prof") prof = true;
         else if (a == "-dev" && ai + 1 < argc) devIdx = std::atoi(argv[++ai]);
@@ -284,10 +311,16 @@ int main(int argc, char** argv) {
         else if (a == "-fresh") resume = false;
         else { logFatal("bad arg %s", a.c_str()); return 1; }
     }
-    // FFT length L = 2^k (M31 has only power-of-two roots here). Largest bits/word for each length, from round-off
-    // surveys on Kaggle T4 (CUDA) and a Radeon 780M (OpenCL), 2-3 n per point, chosen so that the worst maxerr at every
-    // cutoff is about the same (~0.27): 128K and shorter 17.7, 256K 17.45 (n <= 4,574,412), 512K 17.2 (9,017,753),
-    // 1024K 16.95 (17,773,363), 2048K 16.5 (34,603,008); longer lengths were not measured, so larger n are refused.
+    // ---- GPU: CUDA on NVIDIA (when built with HYPRP_CUDA), OpenCL otherwise. The arithmetic mode: FP64 on GPUs with
+    // full-rate FP64 (or --fp64), FP32 + M31 elsewhere (or --fp32).
+    std::unique_ptr<Gpu> gpu = makeGpu(devIdx, prof);
+    const bool fp64 = fp64Arg >= 0 ? fp64Arg == 1 : gpu->fp64Fast;
+
+    // FFT length L = 2^k (M31 has only power-of-two roots here). Largest bits/word for each length (maxBitsFor).
+    // FP32 + M31, from round-off surveys on Kaggle T4 (CUDA) and a Radeon 780M (OpenCL), 2-3 n per point, chosen so
+    // that the worst maxerr at every cutoff is about the same (~0.27): 128K and shorter 17.7, 256K 17.45
+    // (n <= 4,574,412), 512K 17.2 (9,017,753), 1024K 16.95 (17,773,363), 2048K 16.5 (34,603,008).
+    // Longer lengths were not measured, so larger n are refused.
     // n just below L * q / 4 (q integer) has an almost periodic digit-width pattern and ~0.05-0.15 more round-off at
     // the same bits/word, so within 32 of such a point the next length is used. -L k forces L = 2^k (the benchmark).
     uint64_t L = 0;
@@ -295,14 +328,38 @@ int main(int argc, char** argv) {
     else
         for (uint64_t cand = 64;; cand *= 2) {
             if (cand > (1u << 21)) { L = cand; break; }  // refused below
-            if ((double)n / (double)cand <= maxBitsFor(ilog2(cand))) {
+            if ((double)n / (double)cand <= maxBitsFor(ilog2(cand), fp64)) {
                 L = nearFraction(n, cand) && cand < (1u << 21) ? 2 * cand : cand;
                 break;
             }
         }
     if (L > (1u << 21)) {  // longer lengths have not been measured
-        logFatal("n = %u is too large: hyprp handles n up to 34,603,008 (FFT length 2048K)", n);
+        logFatal("n = %u is too large: the longest FFT length measured is 2048K (n up to %llu in this mode)", n,
+                 (unsigned long long)((double)(1u << 21) * maxBitsFor(21, fp64)));
         return 2;
+    }
+    // A checkpoint keeps the digits of the FFT length it was written with. Resuming on a GPU that would pick another
+    // length (the other arithmetic mode), keep the checkpoint's length when it is a longer one or within this mode's
+    // bits/word limit; otherwise the checkpoint cannot be used here.
+    char ckname[128];
+    std::snprintf(ckname, sizeof(ckname), "hyprp_%u_%lld.ckpt", n, cc);
+    if (gec && iters_limit == 0 && resume && !logL) {
+        if (FILE* f = std::fopen(ckname, "rb")) {
+            uint64_t hdr[4];
+            if (std::fread(hdr, 8, 4, f) == 4 && hdr[0] == n && hdr[1] == (uint64_t)cc && hdr[2] != L) {
+                const uint64_t Lc = hdr[2];
+                const bool pow2 = Lc >= 64 && Lc <= (1u << 21) && (Lc & (Lc - 1)) == 0;
+                if (pow2 && (Lc > L || (double)n / (double)Lc <= maxBitsFor(ilog2(Lc), fp64))) {
+                    logInfo("using the checkpoint's FFT length %llu (this mode would pick %llu)",
+                            (unsigned long long)Lc, (unsigned long long)L);
+                    L = Lc;
+                } else {
+                    logWarn("the checkpoint %s is for FFT length %llu, too short for %s mode: starting over", ckname,
+                            (unsigned long long)Lc, fp64 ? "FP64" : "FP32+M31");
+                }
+            }
+            std::fclose(f);
+        }
     }
     // four-step layout: W x H complex elements (W = 512 lines, wider when H would pass 1024), TG tail columns per
     // work-group, WG work-items; W=512 TG=2 WG=128 was the fastest on Kaggle T4
@@ -314,8 +371,8 @@ int main(int argc, char** argv) {
     uint32_t TGc = 2;
     while (TGc > 1 && (2 * TGc * H > 2048 || (W / 2) % TGc)) TGc >>= 1;  // tail LDS = 32 * TG * H bytes
     const uint32_t WGc = 128;
-    logInfo("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u TG=%u WG=%u  [FP32+M31]", n, cc, (unsigned long long)L,
-            (double)n / L, W, H, TGc, WGc);
+    logInfo("n=%u c=%lld  L=%llu (%.3f bits/word)  W=%u H=%u TG=%u WG=%u  [%s]", n, cc, (unsigned long long)L,
+            (double)n / L, W, H, TGc, WGc, fp64 ? "FP64" : "FP32+M31");
     // radix-8/4/2 Stockham stages of a power-of-two line FFT, as STW(R, PS) / STH(R, PS) items for hyprp.cl
     auto stages = [](uint32_t P, const char* tag) {
         std::string out;
@@ -333,8 +390,7 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    // ---- GPU setup: CUDA on NVIDIA (when built with HYPRP_CUDA), OpenCL otherwise
-    std::unique_ptr<Gpu> gpu = makeGpu(devIdx, prof);
+    // ---- kernels
     std::string exe_dir = argv[0];
     auto pos = exe_dir.find_last_of("\\/");
     exe_dir = pos == std::string::npos ? "" : exe_dir.substr(0, pos + 1);
@@ -346,7 +402,7 @@ int main(int argc, char** argv) {
     // digits are stored as 16-bit pairs when every (balanced) digit fits in int16, i.e. n <= 16 L
     const bool dig16 = (n + L - 1) / L <= 16;
     const size_t DB = dig16 ? 4 : 8;  // bytes per element of the digit array
-    logInfo("options: digits %s", dig16 ? "16-bit" : "32-bit");
+    logInfo("options: digits %s, %s", dig16 ? "16-bit" : "32-bit", fp64 ? "FP64" : "FP32+M31");
     uint32_t MUc = 0;
     for (uint32_t u = 1; u < 31; ++u) if ((L % 31) * u % 31 == 1) MUc = u;
     {
@@ -357,6 +413,7 @@ int main(int argc, char** argv) {
                       W, H, n, cc, TGc, NH, WGc, MUc, ilog2(NC));
         std::string src = b;
         if (dig16) src += "#define DIG16 1\n";
+        if (fp64) src += "#define FP64 1\n";
         src += "#define WSTAGES " + stages(W, "STW") + "\n";
         src += "#define HSTAGES " + stages(H, "STH") + "\n";
         src += ss.str();
@@ -382,34 +439,46 @@ int main(int argc, char** argv) {
     GpuKernel kF = gpu->kernel("fwdW"), kT = gpu->kernel("tail"), kTF = gpu->kernel("tailFwd");
     GpuKernel kTM = gpu->kernel("tailMul"), kI = gpu->kernel("invW");
 
-    // ---- tables: twiddles as (FP32 complex, GF(p^2) element); weights as (FP32 factor, GF(p) factor)
-    if (mpow((uint64_t)cc % P31, (P31 - 1) / 2) != 1) {
-        logFatal("c = %lld is not a square mod 2^31-1: its L-th root does not exist", cc);
+    // ---- tables: twiddles as (FP32 complex, GF(p^2) element) or, in FP64 mode, double complex; weights as (FP32
+    // factor, GF(p) factor) or a double. Both kinds of entry take the same room (16 and 8 bytes).
+    if (!fp64 && mpow((uint64_t)cc % P31, (P31 - 1) / 2) != 1) {
+        logFatal("c = %lld is not a square mod 2^31-1: its L-th root does not exist (try --fp64)", cc);
         return 1;
     }
-    const uint32_t KN = ilog2(NC);
-    const G2 gN = m31root(KN);
     struct hc { float a, b; uint32_t c, d; };
-    auto toh = [](cplx v, G2 m) { return hc{(float)v.x, (float)v.y, (uint32_t)m.re, (uint32_t)m.im}; };
+    struct dc { double x, y; };
+    static_assert(sizeof(hc) == 16 && sizeof(dc) == 16, "a twiddle entry is 16 bytes in both modes");
     std::vector<hc> twW(W), twH(H), twN1(W), twN2(H);
-    for (uint32_t i = 0; i < W; ++i) {
-        twW[i] = toh(root(i, W), gpow(gN, (NC / W) * (uint64_t)i));
-        twN1[i] = toh(root(i, NC), gpow(gN, i));
-    }
-    for (uint32_t i = 0; i < H; ++i) {
-        twH[i] = toh(root(i, H), gpow(gN, (NC / H) * (uint64_t)i));
-        twN2[i] = toh(root((uint64_t)W * i, NC), gpow(gN, (uint64_t)W * i));
+    if (fp64) {
+        auto tod = [](cplx v) { hc h; dc d{v.x, v.y}; std::memcpy(&h, &d, 16); return h; };
+        for (uint32_t i = 0; i < W; ++i) { twW[i] = tod(root(i, W)); twN1[i] = tod(root(i, NC)); }
+        for (uint32_t i = 0; i < H; ++i) { twH[i] = tod(root(i, H)); twN2[i] = tod(root((uint64_t)W * i, NC)); }
+    } else {
+        const G2 gN = m31root(ilog2(NC));
+        auto toh = [](cplx v, G2 m) { return hc{(float)v.x, (float)v.y, (uint32_t)m.re, (uint32_t)m.im}; };
+        for (uint32_t i = 0; i < W; ++i) {
+            twW[i] = toh(root(i, W), gpow(gN, (NC / W) * (uint64_t)i));
+            twN1[i] = toh(root(i, NC), gpow(gN, i));
+        }
+        for (uint32_t i = 0; i < H; ++i) {
+            twH[i] = toh(root(i, H), gpow(gN, (NC / H) * (uint64_t)i));
+            twN2[i] = toh(root((uint64_t)W * i, NC), gpow(gN, (uint64_t)W * i));
+        }
     }
     const uint32_t WSn = 512;
     std::vector<float> WTAB(2 * (2 * NH + 2 * WSn), 0.f);
     std::vector<uint32_t> ITAB(2 * NH + 2 * WSn, 0);
     {
         const double log2c = std::log2((double)cc);
-        const int64_t half = (int64_t)(P31 - 1) / 2;  // odd; the order of c divides it
-        const uint64_t kappa = mpow((uint64_t)cc, (uint64_t)invmod((int64_t)(L % half), half));  // c^(1/L)
-        if (mpow(kappa, L) != (uint64_t)cc % P31) { logFatal("c^(1/L) failed"); return 1; }
-        const uint64_t ikappa = mpow(kappa, P31 - 2);
+        uint64_t kappa = 1, ikappa = 1;
+        if (!fp64) {
+            const int64_t half = (int64_t)(P31 - 1) / 2;  // odd; the order of c divides it
+            kappa = mpow((uint64_t)cc, (uint64_t)invmod((int64_t)(L % half), half));  // c^(1/L)
+            if (mpow(kappa, L) != (uint64_t)cc % P31) { logFatal("c^(1/L) failed"); return 1; }
+            ikappa = mpow(kappa, P31 - 2);
+        }
         auto put = [&](size_t idx, double v, uint64_t m) {
+            if (fp64) { std::memcpy(&WTAB[2 * idx], &v, 8); return; }
             WTAB[2 * idx] = (float)v;
             uint32_t mb = (uint32_t)m;
             std::memcpy(&WTAB[2 * idx + 1], &mb, 4);
@@ -661,7 +730,14 @@ int main(int argc, char** argv) {
             r2048 += b;
         }
         logInfo("RES2048 %s", r2048.c_str());
-        if (full) logInfo("2^%u-%lld is %s", n, cc, isone ? "a probable prime!" : "composite");
+        if (full) {
+            logInfo("2^%u-%lld is %s", n, cc, isone ? "a probable prime!" : "composite");
+            // checksum of the result, so that a result copied or typed by hand can be checked (it guards against slips,
+            // not against forgery): CRC-32 (zlib / IEEE 802.3) of "hyprp,<version>,1,2,<n>,<-c>,<P|C>,<RES64>,<RES2048>"
+            char head[96];
+            std::snprintf(head, sizeof(head), "hyprp,%s,1,2,%u,%lld,%c,%016llX,", VERSION, n, -cc, isone ? 'P' : 'C', res64);
+            logInfo("checksum %08X", crc32Text(std::string(head) + r2048));
+        }
     };
 
     setSmall(X, 3);
@@ -690,8 +766,6 @@ int main(int argc, char** argv) {
     // Iterations 0 .. G-1 all have mulc = 3 (exponent bits >= 40). y = 3x then satisfies y -> y^2,
     // so with d_s = prod_{u<=s} y_u (one y every B iterations): d_s == y_0 * d_(s-1)^(2^B).
     const long long G = (long long)n - 41;
-    char ckname[128];
-    std::snprintf(ckname, sizeof(ckname), "hyprp_%u_%lld.ckpt", n, cc);
     long long it = 0;
     auto saveCk = [&](long long iter) {
         readD(X.D);
