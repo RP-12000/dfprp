@@ -92,7 +92,7 @@ public:
         }
         if (devs.empty()) { logFatal("no OpenCL GPU"); std::exit(1); }
         dev = devs[std::min<size_t>((size_t)devIdx, devs.size() - 1)];
-        char nm[256], ver[256], drv[256];
+        char nm[256] = "", ver[256] = "", drv[256] = "";
         cl_uint cus = 1, clk = 0;
         cl_ulong lmem = 0, gmem = 0;
         clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(nm), nm, nullptr);
@@ -102,6 +102,7 @@ public:
         clGetDeviceInfo(dev, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(clk), &clk, nullptr);
         clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lmem), &lmem, nullptr);
         clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, nullptr);
+        nm[sizeof(nm) - 1] = ver[sizeof(ver) - 1] = drv[sizeof(drv) - 1] = '\0';  // in case a string was cut off
         name = nm;
         unsigned char ub[16];  // cl_khr_device_uuid: CL_DEVICE_UUID_KHR = 0x106A, 16 bytes
         if (clGetDeviceInfo(dev, 0x106A, 16, ub, nullptr) == CL_SUCCESS) uuid = uuidText(ub);

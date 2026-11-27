@@ -779,7 +779,7 @@ int main(int argc, char** argv) {
         std::fwrite(CYh.data(), 8, CYh.size(), f);
         std::fclose(f);
         std::remove(ckname);
-        std::rename(tmp.c_str(), ckname);
+        if (std::rename(tmp.c_str(), ckname) != 0) logWarn("could not save the checkpoint %s", ckname);
     };
     if (resume) {
         FILE* f = std::fopen(ckname, "rb");
